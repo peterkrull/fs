@@ -80,6 +80,26 @@ independent of rendering (`src/sim`).
 The sensors report what a flight controller would measure, without noise: angular rates and
 specific force in the body frame, position, velocity, attitude, airspeed and battery state.
 
+## Aircraft
+
+| | |
+|---|---|
+| [`uav.ron`](assets/aircraft/uav.ron) | a 2 m UAV with a top-mounted wing, a conventional tail and a pusher propeller above the wing |
+| [`flying_wing.ron`](assets/aircraft/flying_wing.ron) | a 1.5 m flying wing with elevons, winglets with rudders, and a pusher propeller at the back |
+
+```bash
+cargo run --release -- --aircraft assets/aircraft/flying_wing.ron
+```
+
+Both are stable without a pilot: `cargo test` checks for every aircraft that its center of
+gravity is ahead of its neutral point, that it is trimmed for a sensible speed with the controls
+centered, that it glides hands off and holds a bank without spiraling, and that each stick turns
+it the right way. The flying wing is stable in pitch without a tail through its sweep and
+washout, which make the tips act as a tail, and its reflexed airfoil.
+
+Each comes with ArduPlane parameters, such as the elevon outputs of the flying wing, in the
+`.parm` file next to it.
+
 ## Aircraft definitions
 
 Aircraft are defined in [RON](https://github.com/ron-rs/ron), see
@@ -92,7 +112,8 @@ origin, angles in degrees.
   moment, stall angles) or a `Table` of coefficients by angle of attack, such as from XFoil.
 - `surfaces`: wings, tails and fins, each from a root leading edge outwards through `sections`
   with their own span, tip chord, sweep, dihedral, twist, number of cells, airfoil and
-  `controls`. Surfaces can be mirrored, with their controls deflecting symmetrically (elevators),
+  `controls`. A section may set its own `incidence`, such as a winglet at the tip of a twisted
+  wing. Surfaces can be mirrored, with their controls deflecting symmetrically (elevators),
   antisymmetrically (ailerons) or by another actuator. A fin is a section with a dihedral of 90°.
 - `bodies`: fuselages and pods, as a radius profile along their length.
 - `drag`: other drag, such as landing gear or multicopter arms.
@@ -113,14 +134,28 @@ simulation thereby runs exactly as fast as ArduPilot, and the rendering never ho
 ```bash
 cargo run --release -- --sitl
 
-# In the ArduPilot repository, with the location the simulator prints at startup
-build/sitl/bin/arduplane --model JSON:127.0.0.1 --home 46.6863,7.8632,700,70 \
+# In the ArduPilot repository. The simulator prints this command at startup, with the
+# location it spawns at and the parameters of the aircraft.
+build/sitl/bin/arduplane --model JSON:127.0.0.1 --serial0 tcp:0 --home 46.6863,7.8632,700,70 \
     --defaults Tools/autotest/models/plane.parm,/path/to/bevy-worldmap/assets/aircraft/uav.parm
 ```
 
-`sim_vehicle.py -v ArduPlane --model JSON:127.0.0.1 --custom-location=46.6863,7.8632,700,70`
-with `uav.parm` added should work as well, though only the command above has been tested. Arm, for example in LOITER, and press **L** to launch.
-[`scripts/sitl_loiter.py`](scripts/sitl_loiter.py) does the arming and logs the flight.
+**`--serial0 tcp:0` matters**: without it, ArduPlane prints `Waiting for connection ....` and
+does not start, nor talk to the simulator, until a ground station connects to TCP port 5760.
+With it, ArduPlane starts right away, and a ground station can still connect to that port at any
+time, such as `mavproxy.py --master tcp:127.0.0.1:5760` or QGroundControl with a TCP link.
+`sim_vehicle.py`, which starts MAVProxy itself, should work too, but has not been tested here.
+
+For the flying wing, run the simulator with `--aircraft assets/aircraft/flying_wing.ron`, and
+use `flying_wing.parm` in place of `uav.parm`.
+
+Arm, for example in LOITER, and press **L** to launch.
+[`scripts/sitl_loiter.py`](scripts/sitl_loiter.py) connects as a ground station, arms, and logs
+the flight.
+
+To run several simulations side by side, give each ArduPlane its own instance with `-I N`, which
+moves its ports up by `10 * N`, and the simulator the matching port, such as `--sitl 9012` for
+`-I 1`.
 
 `sim-headless` runs the same simulation without graphics, over flat ground, for automated tests:
 

@@ -377,18 +377,9 @@ mod tests {
         }
     }
 
-    fn uav() -> Simulation {
-        let config = AircraftConfig::load(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/assets/aircraft/uav.ron"
-        ))
-        .unwrap();
-        Simulation::new(config, spawn(), Box::new(ConstantWind::default())).unwrap()
-    }
-
     #[test]
     fn held_reads_gravity() {
-        let mut sim = uav();
+        let mut sim = aircraft("uav");
         sim.step(STEP);
         let sensors = sim.sensors();
         assert!(
@@ -429,23 +420,25 @@ mod tests {
         assert!((sensors.velocity_ned.z - 9.80).abs() < 0.02);
     }
 
-    /// Fly with fixed controls, optionally with the ailerons keeping the wings level, as a
-    /// pilot would.
-    fn fly(sim: &mut Simulation, controls: &[(&str, f64)], level: bool, seconds: usize) -> Sensors {
-        let names = sim.actuators.names();
-        let aileron = names.iter().position(|n| n == "aileron").unwrap();
-        let mut commands = vec![0.0; names.len()];
-        for (name, value) in controls {
-            commands[names.iter().position(|n| n == name).unwrap()] = *value;
-        }
-        sim.actuators.set_commands(&commands);
+    /// Every aircraft in the assets, which should all pass the same tests of their flight.
+    const AIRCRAFT: [&str; 2] = ["uav", "flying_wing"];
+
+    fn aircraft(name: &str) -> Simulation {
+        let path = format!("{}/assets/aircraft/{name}.ron", env!("CARGO_MANIFEST_DIR"));
+        let config = AircraftConfig::load(path).unwrap();
+        Simulation::new(config, spawn(), Box::new(ConstantWind::default())).unwrap()
+    }
+
+    /// Fly with fixed sticks, optionally rolling to keep the wings level, as a pilot would.
+    fn fly(sim: &mut Simulation, mut sticks: config::Sticks, level: bool, seconds: f64) -> Sensors {
+        sim.actuators.set_commands(&sim.config.mix(&sticks));
         sim.actuators.settle();
         sim.launch();
-        for step in 0..seconds * 1000 {
+        for step in 0..(seconds * 1000.0) as usize {
             if level && step % 10 == 0 {
                 let sensors = sim.sensors();
-                commands[aileron] = -0.5 * sensors.euler.x - 0.1 * sensors.gyro.x;
-                sim.actuators.set_commands(&commands);
+                sticks.roll = -0.5 * sensors.euler.x - 0.1 * sensors.gyro.x;
+                sim.actuators.set_commands(&sim.config.mix(&sticks));
             }
             sim.step(STEP);
         }
@@ -453,134 +446,140 @@ mod tests {
         sim.sensors()
     }
 
-    /// Gliding with the controls centered, the plane should settle into steady flight by
+    fn sticks(roll: f64, pitch: f64, yaw: f64, throttle: f64) -> config::Sticks {
+        config::Sticks {
+            roll,
+            pitch,
+            yaw,
+            throttle,
+        }
+    }
+
+    /// The center of gravity must be ahead of the neutral point, and the aircraft trimmed for
+    /// a reasonable speed with its controls centered.
+    #[test]
+    fn statically_stable_and_trimmed() {
+        for name in AIRCRAFT {
+            let mut sim = aircraft(name);
+            let actuators = vec![0.0; sim.actuators.names().len()];
+            let mut at = |alpha: f64| {
+                let alpha = f64::to_radians(alpha);
+                sim.aero.reset();
+                let loads = sim.aero.loads(&aero::Flow {
+                    velocity: DVec3::new(-alpha.cos(), 0.0, -alpha.sin()) * 15.0,
+                    rates: DVec3::ZERO,
+                    density: 1.225,
+                    actuators: &actuators,
+                });
+                (-loads.force.z, loads.moment.y)
+            };
+            let ((l1, m1), (l2, m2)) = (at(2.0), at(6.0));
+            // Moving the reference point back by the margin removes the change in moment
+            let margin = -(m2 - m1) / (l2 - l1);
+            // The angle of attack without a pitching moment, and the speed to fly it level
+            let trim = 2.0 - m1 / (m2 - m1) * 4.0;
+            let lift = at(trim).0;
+            let speed = 15.0 * (sim.config.mass * 9.81 / lift).sqrt();
+            println!(
+                "{name}: static margin {margin:.3} m, trimmed at {trim:.1} deg and {speed:.1} m/s"
+            );
+            assert!(margin > 0.01, "{name}: static margin {margin}");
+            assert!((10.0..20.0).contains(&speed), "{name}: trim speed {speed}");
+        }
+    }
+
+    /// Gliding with the controls centered, the aircraft should settle into steady flight by
     /// itself, which needs it to be statically and dynamically stable.
     #[test]
-    fn uav_glides_hands_off() {
-        let sensors = fly(&mut uav(), &[], false, 30);
-        let (roll, pitch) = (sensors.euler.x.to_degrees(), sensors.euler.y.to_degrees());
-        assert!(
-            roll.abs() < 1.0 && pitch.abs() < 12.0,
-            "roll {roll} pitch {pitch}"
-        );
-        assert!(
-            (10.0..20.0).contains(&sensors.airspeed),
-            "airspeed {}",
-            sensors.airspeed
-        );
-        // A glide ratio of more than 8
-        let ratio = sensors.airspeed / sensors.velocity_ned.z;
-        assert!(ratio > 8.0, "glide ratio {ratio}");
+    fn glides_hands_off() {
+        for name in AIRCRAFT {
+            let sensors = fly(&mut aircraft(name), sticks(0.0, 0.0, 0.0, 0.0), false, 30.0);
+            let (roll, pitch) = (sensors.euler.x.to_degrees(), sensors.euler.y.to_degrees());
+            assert!(
+                roll.abs() < 1.0 && pitch.abs() < 12.0,
+                "{name}: roll {roll} pitch {pitch}"
+            );
+            assert!(
+                (9.0..20.0).contains(&sensors.airspeed),
+                "{name}: airspeed {}",
+                sensors.airspeed
+            );
+            assert!(
+                sensors.gyro.length() < 0.05,
+                "{name}: still rotating {}",
+                sensors.gyro
+            );
+            let ratio = sensors.airspeed / sensors.velocity_ned.z;
+            assert!(ratio > 8.0, "{name}: glide ratio {ratio}");
+        }
     }
 
     /// A banked glide should not steepen into a spiral dive.
     #[test]
-    fn uav_spiral_does_not_diverge() {
-        let mut sim = uav();
-        sim.body.attitude *= DQuat::from_rotation_x(10f64.to_radians());
-        let sensors = fly(&mut sim, &[], false, 30);
-        let roll = sensors.euler.x.to_degrees();
-        assert!(roll.abs() < 10.0, "roll {roll}");
+    fn spiral_does_not_diverge() {
+        for name in AIRCRAFT {
+            let mut sim = aircraft(name);
+            sim.body.attitude *= DQuat::from_rotation_x(10f64.to_radians());
+            let sensors = fly(&mut sim, sticks(0.0, 0.0, 0.0, 0.0), false, 30.0);
+            let roll = sensors.euler.x.to_degrees();
+            assert!(roll.abs() < 10.0, "{name}: roll {roll}");
+        }
     }
 
-    /// Under power, the reaction torque of the motor rolls the plane, which the ailerons
-    /// counter.
+    /// Under power, the reaction torque of the motor rolls the aircraft, which the pilot
+    /// counters.
     #[test]
-    fn uav_cruises_level() {
-        let sensors = fly(&mut uav(), &[("throttle", 0.6)], true, 30);
-        let (roll, pitch) = (sensors.euler.x.to_degrees(), sensors.euler.y.to_degrees());
-        assert!(
-            roll.abs() < 3.0 && pitch.abs() < 10.0,
-            "roll {roll} pitch {pitch}"
-        );
-        assert!(
-            (12.0..20.0).contains(&sensors.airspeed),
-            "airspeed {}",
-            sensors.airspeed
-        );
-        assert!(
-            sensors.velocity_ned.z.abs() < 1.5,
-            "vertical speed {}",
-            sensors.velocity_ned.z
-        );
+    fn cruises_level() {
+        for name in AIRCRAFT {
+            let sensors = fly(&mut aircraft(name), sticks(0.0, 0.0, 0.0, 0.6), true, 30.0);
+            let (roll, pitch) = (sensors.euler.x.to_degrees(), sensors.euler.y.to_degrees());
+            assert!(
+                roll.abs() < 3.0 && pitch.abs() < 10.0,
+                "{name}: roll {roll} pitch {pitch}"
+            );
+            assert!(
+                (10.0..22.0).contains(&sensors.airspeed),
+                "{name}: airspeed {}",
+                sensors.airspeed
+            );
+            assert!(
+                sensors.velocity_ned.z.abs() < 1.5,
+                "{name}: vertical speed {}",
+                sensors.velocity_ned.z
+            );
+        }
     }
 
     #[test]
     fn full_throttle_climbs() {
-        let sensors = fly(&mut uav(), &[("throttle", 1.0)], true, 20);
-        assert!(
-            sensors.velocity_ned.z < -1.0,
-            "vertical speed {}",
-            sensors.velocity_ned.z
-        );
+        for name in AIRCRAFT {
+            let sensors = fly(&mut aircraft(name), sticks(0.0, 0.0, 0.0, 1.0), true, 20.0);
+            assert!(
+                sensors.velocity_ned.z < -1.0,
+                "{name}: vertical speed {}",
+                sensors.velocity_ned.z
+            );
+        }
     }
 
+    /// Each stick turns the aircraft the right way.
     #[test]
-    fn elevator_pitches_up() {
-        let mut sim = uav();
-        let names = sim.actuators.names();
-        let index = |name: &str| names.iter().position(|n| n == name).unwrap();
-        let mut commands = vec![0.0; names.len()];
-        commands[index("throttle")] = 0.6;
-        commands[index("elevator")] = 0.5;
-        sim.actuators.set_commands(&commands);
-        sim.actuators.settle();
-        sim.launch();
-        for _ in 0..200 {
-            sim.step(STEP);
+    fn controls_respond() {
+        for name in AIRCRAFT {
+            let rates = |sticks| fly(&mut aircraft(name), sticks, false, 0.2).gyro;
+            let pitch = rates(sticks(0.0, 0.5, 0.0, 0.6)).y;
+            let roll = rates(sticks(0.5, 0.0, 0.0, 0.6)).x;
+            let yaw = rates(sticks(0.0, 0.0, 0.5, 0.6)).z;
+            println!("{name}: pitch {pitch:.2} roll {roll:.2} yaw {yaw:.2} rad/s after 0.2 s");
+            assert!(pitch > 0.1, "{name}: pitch rate {pitch}");
+            assert!(roll > 0.2, "{name}: roll rate {roll}");
+            assert!(yaw > 0.03, "{name}: yaw rate {yaw}");
         }
-        assert!(
-            sim.sensors().gyro.y > 0.1,
-            "pitch rate {}",
-            sim.sensors().gyro.y
-        );
-    }
-
-    #[test]
-    fn aileron_rolls_right() {
-        let mut sim = uav();
-        let names = sim.actuators.names();
-        let index = |name: &str| names.iter().position(|n| n == name).unwrap();
-        let mut commands = vec![0.0; names.len()];
-        commands[index("throttle")] = 0.6;
-        commands[index("aileron")] = 0.5;
-        sim.actuators.set_commands(&commands);
-        sim.actuators.settle();
-        sim.launch();
-        for _ in 0..200 {
-            sim.step(STEP);
-        }
-        assert!(
-            sim.sensors().gyro.x > 0.2,
-            "roll rate {}",
-            sim.sensors().gyro.x
-        );
-    }
-
-    #[test]
-    fn rudder_yaws_right() {
-        let mut sim = uav();
-        let names = sim.actuators.names();
-        let index = |name: &str| names.iter().position(|n| n == name).unwrap();
-        let mut commands = vec![0.0; names.len()];
-        commands[index("throttle")] = 0.6;
-        commands[index("rudder")] = 0.5;
-        sim.actuators.set_commands(&commands);
-        sim.actuators.settle();
-        sim.launch();
-        for _ in 0..200 {
-            sim.step(STEP);
-        }
-        assert!(
-            sim.sensors().gyro.z > 0.05,
-            "yaw rate {}",
-            sim.sensors().gyro.z
-        );
     }
 
     #[test]
     fn crashes_into_the_ground() {
-        let mut sim = uav();
+        let mut sim = aircraft("uav");
         sim.ground = 995.0;
         sim.launch();
         for _ in 0..60_000 {

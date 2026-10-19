@@ -1,0 +1,147 @@
+// A flying wing with a 1.5 m span: a swept, tapered wing with washout and a reflexed airfoil, a
+// small center body, and a pusher propeller at the back. Winglets at the tips carry rudders.
+//
+// Without a tail, the wing is stable in pitch through its sweep and washout: the tips, behind
+// the center of gravity, fly at a lower angle of attack and act as the tail. The reflexed airfoil
+// has almost no pitching moment of its own, and the center of gravity sits slightly ahead of the
+// neutral point.
+//
+// The model frame is forward-right-down, in meters, with its origin at the nose. Angles are in
+// degrees. The servo channels follow ArduPlane: left and right elevon on 1 and 2 (functions 77
+// and 78), throttle on 3, rudder on 4. Positive elevon values move their trailing edge up.
+(
+    name: "Flying wing 1.5m",
+    mass: 1.2,
+    center_of_gravity: (-0.245, 0.0, 0.01),
+    inertia: (ixx: 0.07, iyy: 0.03, izz: 0.10),
+
+    airfoils: {
+        // A reflexed airfoil like the MH 45, with a pitching moment close to zero
+        "mh45": Parametric(
+            lift_slope: 5.9,
+            zero_lift_angle: -1.0,
+            cd_min: 0.011,
+            cd_k: 0.012,
+            cm: 0.0,
+            stall_positive: 11.0,
+            stall_negative: -9.0,
+            shape: (thickness: 0.098, camber: 0.012, camber_position: 0.3),
+        ),
+        "naca0009": Parametric(
+            lift_slope: 5.8,
+            cd_min: 0.012,
+            cd_k: 0.01,
+            stall_positive: 10.0,
+            stall_negative: -10.0,
+            shape: (thickness: 0.09),
+        ),
+    },
+
+    surfaces: [
+        (
+            name: "wing",
+            airfoil: "mh45",
+            root: (-0.05, 0.0, 0.0),
+            root_chord: 0.38,
+            incidence: 1.0,
+            mirror: true,
+            sections: [
+                // Straight through the center body
+                (span: 0.06, tip_chord: 0.37, cells: 1),
+                (
+                    span: 0.63,
+                    tip_chord: 0.18,
+                    sweep: 28.0,
+                    twist: -4.0,
+                    cells: 10,
+                    controls: [
+                        (
+                            actuator: "elevon_right",
+                            deflection: -20.0,
+                            chord_fraction: 0.22,
+                            extent: (0.15, 0.95),
+                            mirror: Actuator("elevon_left"),
+                        ),
+                    ],
+                ),
+                // Winglets, which also make the wing stable in yaw
+                (
+                    span: 0.14,
+                    tip_chord: 0.10,
+                    sweep: 35.0,
+                    dihedral: 90.0,
+                    incidence: 0.0,
+                    cells: 3,
+                    airfoil: "naca0009",
+                    controls: [
+                        (
+                            actuator: "rudder",
+                            deflection: 25.0,
+                            chord_fraction: 0.35,
+                            extent: (0.0, 0.9),
+                            mirror: Antisymmetric,
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    ],
+
+    bodies: [
+        (
+            name: "center body",
+            nose: (0.0, 0.0, 0.02),
+            length: 0.44,
+            profile: [(0.0, 0.0), (0.1, 0.035), (0.3, 0.045), (0.75, 0.035), (1.0, 0.02)],
+            cells: 8,
+        ),
+    ],
+
+    rotors: [
+        (
+            name: "propeller",
+            position: (-0.47, 0.0, 0.02),
+            axis: (1.0, 0.0, 0.0),
+            // An 8x5 propeller
+            diameter: 0.2032,
+            spin: Clockwise,
+            ct: 0.11,
+            cp: 0.05,
+            zero_thrust_advance: 0.72,
+            inertia: 0.00006,
+            motor: (kv: 1400.0, resistance: 0.1, no_load_current: 0.6),
+            throttle: "throttle",
+        ),
+    ],
+
+    battery: (voltage: 12.6, internal_resistance: 0.04),
+
+    // The pilot's sticks are mixed onto the elevons like ArduPlane does
+    actuators: [
+        (
+            name: "elevon_left",
+            channel: 1,
+            time_constant: 0.02,
+            slew_rate: 20.0,
+            input: [(Pitch, 0.6), (Roll, -0.6)],
+        ),
+        (
+            name: "elevon_right",
+            channel: 2,
+            time_constant: 0.02,
+            slew_rate: 20.0,
+            input: [(Pitch, 0.6), (Roll, 0.6)],
+        ),
+        (
+            name: "throttle",
+            kind: Throttle,
+            channel: 3,
+            time_constant: 0.01,
+            slew_rate: 20.0,
+            input: [(Throttle, 1.0)],
+        ),
+        (name: "rudder", channel: 4, time_constant: 0.02, slew_rate: 20.0, input: [(Yaw, 1.0)]),
+    ],
+
+    visual: Generated,
+)

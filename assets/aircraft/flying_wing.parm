@@ -1,0 +1,15 @@
+# ArduPlane parameters for the flying wing of flying_wing.ron, on top of the defaults for planes
+# (Tools/autotest/models/plane.parm in the ArduPilot repository).
+SERVO1_FUNCTION 77
+SERVO2_FUNCTION 78
+SERVO3_FUNCTION 70
+SERVO4_FUNCTION 21
+AIRSPEED_CRUISE 15
+AIRSPEED_MIN    11
+AIRSPEED_MAX    22
+ARSPD_USE       1
+TRIM_THROTTLE   50
+ROLL_LIMIT_DEG  50
+PTCH_LIM_MAX_DEG 20
+PTCH_LIM_MIN_DEG -20
+WP_LOITER_RAD   60

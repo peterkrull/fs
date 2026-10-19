@@ -25,7 +25,7 @@ use crate::{
     options::Options,
     sim::{
         Simulation, Status,
-        config::{AircraftConfig, Axis},
+        config::{AircraftConfig, Sticks},
         runner::{Mode, Request, SimHandle, Snapshot},
     },
     tiles::Tiles,
@@ -52,12 +52,7 @@ impl Plugin for FlightPlugin {
             }
         };
         if let Mode::Lockstep { port } = options.mode {
-            let s = options.spawn;
-            info!(
-                "Start ArduPilot with: sim_vehicle.py -v ArduPlane --model JSON:127.0.0.1 \
-                 --custom-location={},{},{},{} (listening on UDP port {port})",
-                s.lat, s.lon, s.altitude, s.heading
-            );
+            info!("{}", arduplane_command(path, options, port));
         }
 
         app.insert_resource(flight)
@@ -79,6 +74,31 @@ impl Plugin for FlightPlugin {
                 ),
             );
     }
+}
+
+/// How to start ArduPlane for the simulation. Without `--serial0 tcp:0`, ArduPlane waits for a
+/// ground station to connect to TCP port 5760 before it starts, and sends nothing until then.
+fn arduplane_command(aircraft: &std::path::Path, options: &Options, port: u16) -> String {
+    let s = options.spawn;
+    let mut defaults = "Tools/autotest/models/plane.parm".to_string();
+    // The parameters for an aircraft are kept next to its definition
+    if let Ok(parameters) = aircraft.with_extension("parm").canonicalize() {
+        defaults.push_str(&format!(",{}", parameters.display()));
+    }
+    // Every instance of ArduPilot adds 10 to its ports, starting from 9002 for the simulator
+    // and 5760 for the ground station
+    let (ports, ground_station) = match port.checked_sub(crate::sitl::PORT) {
+        Some(0) => (String::new(), 5760),
+        Some(offset) if offset % 10 == 0 => (format!(" -I {}", offset / 10), 5760 + offset),
+        _ => (format!(" --sim-port-out {port}"), 5760),
+    };
+    format!(
+        "Listening for ArduPilot on UDP port {port}. Start ArduPlane from the ArduPilot \
+         repository with:\n\n    build/sitl/bin/arduplane --model JSON:127.0.0.1{ports} \
+         --serial0 tcp:0 --home {},{},{},{} --defaults {defaults}\n\n\
+         Then connect a ground station to TCP port {ground_station}.",
+        s.lat, s.lon, s.altitude, s.heading,
+    )
 }
 
 /// The simulation, and a copy of its aircraft on the main thread to look up its geometry.
@@ -160,8 +180,9 @@ struct Pilot {
     pitch: f64,
     yaw: f64,
     throttle: f64,
-    /// The channels of a connected RC radio, if any.
-    radio: Option<[f64; radio::CHANNELS]>,
+    /// The channels of a connected RC radio, if any, of which those that have not reported yet
+    /// are `None`.
+    radio: Option<[Option<f64>; radio::CHANNELS]>,
 }
 
 /// How fast the keys move the controls, in full travel per second.
@@ -174,7 +195,7 @@ fn pilot(
     keys: Res<ButtonInput<KeyCode>>,
     // Without it, the keyboard is ignored, but controllers are not
     controls: Option<Res<Controls>>,
-    gamepads: Query<&Gamepad>,
+    mut gamepads: Query<(&Gamepad, Option<&mut radio::Reported>)>,
     radio_map: Res<RadioMap>,
     mode: Res<CameraMode>,
     flight: Res<Flight>,
@@ -186,9 +207,8 @@ fn pilot(
 
     // A radio sets the controls directly, and takes precedence
     pilot.radio = gamepads
-        .iter()
-        .find(|g| radio_map.applies_to(g))
-        .map(radio::channels);
+        .iter_mut()
+        .find_map(|(gamepad, reported)| Some(radio::channels(gamepad, reported?.into_inner())));
     if let Some(channels) = pilot.radio {
         [pilot.roll, pilot.pitch, pilot.yaw, pilot.throttle] = radio_map.controls(&channels);
         send_controls(&flight, &pilot);
@@ -221,7 +241,7 @@ fn pilot(
     };
 
     // Mode 2 gamepad: throttle and yaw on the left stick, roll and pitch on the right
-    for gamepad in gamepads.iter().filter(|g| !radio_map.applies_to(g)) {
+    for (gamepad, _) in gamepads.iter().filter(|(_, reported)| reported.is_none()) {
         let stick = |axis| {
             gamepad
                 .get(axis)
@@ -243,27 +263,15 @@ fn pilot(
 
 /// Mix the controls of the pilot into the actuators, as the aircraft defines.
 fn send_controls(flight: &Flight, pilot: &Pilot) {
-    let commands: Vec<f64> = flight
-        .model
-        .config
-        .actuators
-        .iter()
-        .map(|actuator| {
-            actuator
-                .input
-                .iter()
-                .map(|(axis, gain)| {
-                    gain * match axis {
-                        Axis::Roll => pilot.roll,
-                        Axis::Pitch => pilot.pitch,
-                        Axis::Yaw => pilot.yaw,
-                        Axis::Throttle => pilot.throttle,
-                    }
-                })
-                .sum()
-        })
-        .collect();
-    flight.handle.set_commands(&commands);
+    let sticks = Sticks {
+        roll: pilot.roll,
+        pitch: pilot.pitch,
+        yaw: pilot.yaw,
+        throttle: pilot.throttle,
+    };
+    flight
+        .handle
+        .set_commands(&flight.model.config.mix(&sticks));
 }
 
 /// The camera following the aircraft, which the mouse orbits and the scroll wheel zooms.
@@ -405,7 +413,11 @@ fn update_panel(
             "ArduPilot on UDP {port}: {} Hz, frame {}",
             link.frame_rate, link.frames
         ),
-        (Mode::Lockstep { port }, _) => format!("waiting for ArduPilot on UDP {port}"),
+        (Mode::Lockstep { port }, _) => format!(
+            "waiting for ArduPilot on UDP {port}\n\
+             arduplane waits for a ground station on TCP 5760 to start,\n\
+             unless started with --serial0 tcp:0"
+        ),
     };
     let status = match snapshot.status {
         Status::Held => "HELD, press L to launch",
@@ -469,12 +481,20 @@ fn update_panel(
     if flight.handle.mode == Mode::RealTime {
         match pilot.radio {
             Some(channels) => {
-                let channels: Vec<String> = channels.iter().map(|c| format!("{c:+.2}")).collect();
+                let values: Vec<String> = channels
+                    .iter()
+                    .map(|c| c.map_or("--".into(), |c| format!("{c:+.2}")))
+                    .collect();
                 text.push_str(&format!(
                     "\nRC radio {}: {}",
                     radio_map.describe(),
-                    channels.join(" ")
+                    values.join(" ")
                 ));
+                if !radio_map.synced(&channels) {
+                    text.push_str(
+                        "\nMove all sticks to read their positions, throttle closed until then",
+                    );
+                }
             }
             None => text.push_str("\nArrows: roll and pitch   A D: yaw   W S: throttle"),
         }

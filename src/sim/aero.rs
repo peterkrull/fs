@@ -163,6 +163,9 @@ impl Aerodynamics {
                 let span = DVec3::new(0.0, dihedral.cos(), -dihedral.sin());
                 let sweep = section.sweep.to_radians().tan();
                 let twist = section.twist.to_radians();
+                if let Some(root) = section.incidence {
+                    incidence = root.to_radians();
+                }
                 let station = |t: f64| Station {
                     leading: le + span * (section.span * t) - DVec3::X * (section.span * t * sweep),
                     chord: chord + (section.tip_chord - chord) * t,

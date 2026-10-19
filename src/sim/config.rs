@@ -165,6 +165,10 @@ pub struct Section {
     /// Change in incidence from the root to the tip of the section, negative for washout.
     #[serde(default)]
     pub twist: f64,
+    /// Incidence at the root of the section, if it does not continue that of the previous
+    /// section, such as for a winglet.
+    #[serde(default)]
+    pub incidence: Option<f64>,
     /// Number of spanwise cells the section is divided into.
     #[serde(default = "default_cells")]
     pub cells: usize,
@@ -317,6 +321,42 @@ pub struct Actuator {
     /// stick axes times their gains. Mixes, such as for elevons, are sums of several axes.
     #[serde(default)]
     pub input: Vec<(Axis, f64)>,
+}
+
+impl AircraftConfig {
+    /// Actuator commands for the controls of a pilot, as the actuators mix them.
+    pub fn mix(&self, sticks: &Sticks) -> Vec<f64> {
+        self.actuators
+            .iter()
+            .map(|actuator| {
+                actuator
+                    .input
+                    .iter()
+                    .map(|(axis, gain)| gain * sticks.get(*axis))
+                    .sum()
+            })
+            .collect()
+    }
+}
+
+/// The positions of the sticks of a pilot, see [`Axis`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Sticks {
+    pub roll: f64,
+    pub pitch: f64,
+    pub yaw: f64,
+    pub throttle: f64,
+}
+
+impl Sticks {
+    pub fn get(&self, axis: Axis) -> f64 {
+        match axis {
+            Axis::Roll => self.roll,
+            Axis::Pitch => self.pitch,
+            Axis::Yaw => self.yaw,
+            Axis::Throttle => self.throttle,
+        }
+    }
 }
 
 /// Axes of the controls of a pilot. Positive values roll right, pitch up, yaw right, and
