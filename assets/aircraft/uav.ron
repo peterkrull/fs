@@ -1,0 +1,160 @@
+// A small UAV with a 2 m wingspan: a fuselage with a top-mounted wing, a conventional tail, and
+// a pusher propeller on a pod above the wing.
+//
+// The model frame is forward-right-down (x forward, y right, z down), in meters, with its origin
+// at the tip of the nose. Angles are in degrees.
+//
+// The servo channels match the defaults of ArduPlane: aileron, elevator, throttle, rudder. A
+// positive actuator value rolls right, pitches up and yaws right.
+(
+    name: "UAV 2m pusher",
+    mass: 2.0,
+    // About 30% of the mean aerodynamic chord behind its leading edge
+    center_of_gravity: (-0.36, 0.0, -0.01),
+    inertia: (ixx: 0.14, iyy: 0.16, izz: 0.29),
+
+    airfoils: {
+        // A Clark Y-like cambered airfoil at low Reynolds numbers
+        "clark_y": Parametric(
+            lift_slope: 5.8,
+            zero_lift_angle: -3.5,
+            cd_min: 0.013,
+            cd_k: 0.012,
+            cm: -0.08,
+            stall_positive: 13.0,
+            stall_negative: -8.0,
+            shape: (thickness: 0.117, camber: 0.035),
+        ),
+        "naca0012": Parametric(
+            lift_slope: 5.9,
+            cd_min: 0.014,
+            cd_k: 0.01,
+            stall_positive: 11.0,
+            stall_negative: -11.0,
+            shape: (thickness: 0.12),
+        ),
+    },
+
+    surfaces: [
+        (
+            name: "wing",
+            airfoil: "clark_y",
+            root: (-0.30, 0.0, -0.07),
+            root_chord: 0.22,
+            incidence: 2.0,
+            mirror: true,
+            sections: [
+                (span: 0.5, tip_chord: 0.21, dihedral: 2.0, cells: 6),
+                (
+                    span: 0.5,
+                    tip_chord: 0.15,
+                    sweep: 4.0,
+                    // Polyhedral outer panels make the plane roll back to level by itself
+                    dihedral: 7.0,
+                    twist: -2.0,
+                    cells: 6,
+                    controls: [
+                        (
+                            actuator: "aileron",
+                            deflection: -20.0,
+                            chord_fraction: 0.25,
+                            extent: (0.0, 0.95),
+                            mirror: Antisymmetric,
+                        ),
+                    ],
+                ),
+            ],
+        ),
+        (
+            name: "horizontal tail",
+            airfoil: "naca0012",
+            root: (-0.98, 0.0, -0.03),
+            root_chord: 0.15,
+            incidence: 0.0,
+            mirror: true,
+            sections: [
+                (
+                    span: 0.30,
+                    tip_chord: 0.11,
+                    sweep: 8.0,
+                    cells: 4,
+                    controls: [(actuator: "elevator", deflection: -20.0, chord_fraction: 0.35)],
+                ),
+            ],
+        ),
+        (
+            name: "fin",
+            airfoil: "naca0012",
+            root: (-0.97, 0.0, -0.04),
+            root_chord: 0.18,
+            sections: [
+                (
+                    span: 0.22,
+                    tip_chord: 0.10,
+                    sweep: 30.0,
+                    dihedral: 90.0,
+                    cells: 4,
+                    controls: [(actuator: "rudder", deflection: 25.0, chord_fraction: 0.35)],
+                ),
+            ],
+        ),
+    ],
+
+    bodies: [
+        (
+            name: "fuselage",
+            nose: (0.0, 0.0, 0.0),
+            length: 1.15,
+            profile: [
+                (0.0, 0.0), (0.04, 0.03), (0.12, 0.052), (0.3, 0.06),
+                (0.5, 0.045), (0.75, 0.025), (1.0, 0.015),
+            ],
+            cells: 12,
+        ),
+        (
+            name: "motor pod",
+            nose: (-0.38, 0.0, -0.17),
+            length: 0.17,
+            profile: [(0.0, 0.0), (0.2, 0.02), (0.8, 0.022), (1.0, 0.016)],
+            cells: 3,
+        ),
+    ],
+
+    rotors: [
+        (
+            name: "propeller",
+            position: (-0.565, 0.0, -0.17),
+            // Thrusting forward and slightly down, towards the center of gravity
+            axis: (1.0, 0.0, 0.05),
+            // A 9x6 propeller
+            diameter: 0.2286,
+            spin: Clockwise,
+            ct: 0.11,
+            cp: 0.053,
+            zero_thrust_advance: 0.78,
+            inertia: 0.00012,
+            motor: (kv: 1000.0, resistance: 0.07, no_load_current: 0.8),
+            throttle: "throttle",
+        ),
+    ],
+
+    // A 3S lithium polymer battery
+    battery: (voltage: 12.6, internal_resistance: 0.03),
+
+    // Servos turning 60° in 0.1 s, over a travel of ±20° to ±25° of the surfaces
+    actuators: [
+        (name: "aileron", channel: 1, time_constant: 0.02, slew_rate: 20.0, input: [(Roll, 1.0)]),
+        (name: "elevator", channel: 2, time_constant: 0.02, slew_rate: 20.0, input: [(Pitch, 1.0)]),
+        (
+            name: "throttle",
+            kind: Throttle,
+            channel: 3,
+            time_constant: 0.01,
+            slew_rate: 20.0,
+            input: [(Throttle, 1.0)],
+        ),
+        (name: "rudder", channel: 4, time_constant: 0.02, slew_rate: 20.0, input: [(Yaw, 1.0)]),
+    ],
+
+    visual: Generated,
+)

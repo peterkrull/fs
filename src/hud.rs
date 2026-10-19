@@ -13,10 +13,10 @@ use crate::{
 };
 
 const HELP: &str = "\
-Click: capture mouse   Esc: release   Right drag: look
-W A S D: fly   Space / C: up / down   Shift: faster
-Scroll: speed   T: toggle imagery   [ ]: move the sun
-- =: level of detail   F: freeze tiles   H: hide help";
+Click: capture mouse   Esc: release   Right drag: look   Scroll: zoom or speed
+Free camera: W A S D fly   Space / C: up / down   Shift: faster
+T: toggle imagery   [ ]: move the sun   - =: level of detail
+F: freeze tiles   H: hide help";
 
 pub struct HudPlugin;
 

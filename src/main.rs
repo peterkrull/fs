@@ -1,15 +1,11 @@
 //! A Google Earth-lite: a globe with streamed imagery and elevation.
 
-mod atmosphere;
-mod camera;
-mod fetch;
-mod geo;
-mod hud;
-mod material;
-mod mesh;
-mod sources;
-mod terrain;
-mod tiles;
+use bevy_worldmap::{
+    atmosphere, camera, flight, hud, material,
+    options::{Options, USAGE},
+    sim::runner::Request,
+    sources, terrain, tiles,
+};
 
 use bevy::{
     prelude::*,
@@ -19,6 +15,11 @@ use bevy::{
 use camera::StartView;
 
 fn main() {
+    let options = match Options::parse(std::env::args().skip(1)) {
+        Ok(options) if options.rest.is_empty() => options,
+        Ok(options) => exit_with_usage(&format!("unknown options {:?}", options.rest)),
+        Err(err) => exit_with_usage(&err),
+    };
     let start = start_view().unwrap_or_default();
 
     let mut app = App::new();
@@ -36,6 +37,7 @@ fn main() {
         terrain::TerrainPlugin,
         atmosphere::AtmospherePlugin,
         hud::HudPlugin,
+        flight::FlightPlugin { options },
     ));
 
     if let Some(path) = std::env::var_os("WORLDMAP_SCREENSHOT") {
@@ -62,6 +64,42 @@ fn main() {
         .and_then(|s| s.parse().ok())
     {
         app.insert_resource(camera::Spin(spin));
+    }
+    // For checking the flight views without a person at the controls
+    if let Some(after) = std::env::var("WORLDMAP_LAUNCH")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        app.add_systems(
+            Update,
+            move |time: Res<Time>, flight: Option<Res<flight::Flight>>, mut done: Local<bool>| {
+                if !*done
+                    && time.elapsed_secs() > after
+                    && let Some(flight) = flight
+                {
+                    flight.request(Request::Launch);
+                    *done = true;
+                }
+            },
+        );
+    }
+    if let Some([yaw, pitch, distance]) = std::env::var("WORLDMAP_CHASE").ok().and_then(|s| {
+        let v: Vec<f64> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        <[f64; 3]>::try_from(v).ok()
+    }) {
+        app.insert_resource(flight::Chase {
+            distance,
+            yaw: yaw.to_radians(),
+            pitch: pitch.to_radians(),
+            heading: None,
+        });
+    }
+    if let Ok(views) = std::env::var("WORLDMAP_DEBUG") {
+        app.insert_resource(flight::DebugView {
+            forces: views.contains("forces"),
+            schema: views.contains("schema"),
+            model: !views.contains("nomodel"),
+        });
     }
     if let Some(lon) = std::env::var("WORLDMAP_SUN_LON")
         .ok()
@@ -111,4 +149,9 @@ fn screenshot_and_exit(
             _ => {}
         }
     }
+}
+
+fn exit_with_usage(error: &str) -> ! {
+    eprintln!("{error}\n\n{USAGE}");
+    std::process::exit(1);
 }

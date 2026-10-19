@@ -106,6 +106,12 @@ pub struct Fetcher {
     receiver: Receiver<Fetched>,
 }
 
+impl Default for Fetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Fetcher {
     pub fn new() -> Self {
         // Decoding runs on the blocking pool, so leave cores for rendering

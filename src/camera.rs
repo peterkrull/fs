@@ -52,12 +52,15 @@ impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(View::new(self.start))
             .insert_resource(Controls)
+            .init_resource::<CameraMode>()
             .add_systems(Startup, spawn_camera)
             .add_systems(
                 Update,
                 (
                     grab_cursor,
-                    fly.run_if(resource_exists::<Controls>),
+                    fly.run_if(
+                        resource_exists::<Controls>.and_then(resource_equals(CameraMode::Free)),
+                    ),
                     spin.run_if(resource_exists::<Spin>),
                 )
                     .chain()
@@ -74,6 +77,14 @@ pub struct CameraSystems;
 /// the controls.
 #[derive(Resource)]
 pub struct Spin(pub f64);
+
+/// Whether the camera flies freely, or follows the aircraft.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CameraMode {
+    #[default]
+    Free,
+    Chase,
+}
 
 /// The camera only responds to input while this resource exists.
 #[derive(Resource)]
@@ -92,6 +103,9 @@ pub struct View {
     pub ground: f64,
     /// Speed multiplier, as a power of two.
     pub speed_exp: i32,
+    /// Distance to the closest object that must not be clipped by the near plane, besides
+    /// the terrain.
+    pub nearest: f64,
 }
 
 impl View {
@@ -109,6 +123,7 @@ impl View {
             viewport_height: 1080.0,
             ground: 0.0,
             speed_exp: 0,
+            nearest: f64::INFINITY,
         }
     }
 
@@ -236,7 +251,8 @@ fn sync_camera(mut view: ResMut<View>, camera: Single<(&mut Transform, &mut Proj
     if let Projection::Perspective(perspective) = projection.as_mut() {
         // The depth buffer is reversed and has no far plane, so precision is plentiful
         // even with a near plane this close
-        perspective.near = (view.height_above_ground() * 0.05).clamp(0.05, 1000.0) as f32;
+        let near = (view.height_above_ground() * 0.05).min(view.nearest * 0.5);
+        perspective.near = near.clamp(0.02, 1000.0) as f32;
         view.fov = perspective.fov as f64;
         view.aspect = perspective.aspect_ratio as f64;
     }

@@ -35,7 +35,6 @@ impl TileId {
         y: 0,
     };
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn new(zoom: u8, x: u32, y: u32) -> Self {
         let max = tiles_at(zoom) - 1;
         TileId {

@@ -1,0 +1,11 @@
+# ArduPlane parameters for the 2 m pusher UAV of uav.ron, on top of the defaults for planes
+# (Tools/autotest/models/plane.parm in the ArduPilot repository).
+AIRSPEED_CRUISE 15
+AIRSPEED_MIN    11
+AIRSPEED_MAX    25
+ARSPD_USE       1
+TRIM_THROTTLE   60
+ROLL_LIMIT_DEG  50
+PTCH_LIM_MAX_DEG 20
+PTCH_LIM_MIN_DEG -20
+WP_LOITER_RAD   60

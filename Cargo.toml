@@ -2,11 +2,27 @@
 name = "bevy-worldmap"
 version = "0.1.0"
 edition = "2024"
+default-run = "bevy-worldmap"
+
+[lib]
+name = "bevy_worldmap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bevy-worldmap"
+path = "src/main.rs"
+
+[[bin]]
+name = "sim-headless"
+path = "src/bin/headless.rs"
 
 [dependencies]
 bevy = { version = "0.19.1", default-features = false, features = ["3d", "ui", "default_font", "wayland"] }
 
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
+ron = "0.11"
+serde_json = "1"
 crossbeam-channel = "0.5"
 
 # For fetching tiles
