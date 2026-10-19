@@ -1,0 +1,2 @@
+# Bevy systems take their dependencies as arguments
+too-many-arguments-threshold = 12

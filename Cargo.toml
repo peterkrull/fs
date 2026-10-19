@@ -1,0 +1,24 @@
+[package]
+name = "bevy-worldmap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19.1", default-features = false, features = ["3d", "ui", "default_font", "wayland"] }
+
+log = "0.4"
+crossbeam-channel = "0.5"
+
+# For fetching tiles
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "fs"] }
+reqwest = "0.13.5"
+
+# For decoding tiles
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# Tile decoding and mesh building are much slower without optimizations
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
