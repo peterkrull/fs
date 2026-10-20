@@ -14,7 +14,12 @@
 //! are updated as better data streams in.
 //!
 //! Parents and children are never drawn at the same time, so coarse geometry can not poke
-//! through finer geometry.
+//! through finer geometry. Instead, a tile fades in from its parent after a split: its geometry
+//! morphs from that of the parent, and its imagery blends over that of the parent. Before a
+//! merge, the children fade out into their parent the same way. Tiles also blend into better
+//! imagery as it arrives. Imagery of different zoom levels often differs in tone, which would
+//! otherwise make every change of the level of detail stand out. Terrain that just came into
+//! view does not fade, but appears with the most detail available, see [`APPEAR_SECONDS`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -32,17 +37,18 @@ use bevy::{
 use crate::{
     atmosphere::Sun,
     camera::{CameraSystems, View},
+    fetch::Key,
     geo::{self, EARTH_RADIUS, MAX_HEIGHT, TileId},
     material::{TerrainMaterial, TerrainParams},
-    mesh::{self, TileMesh},
+    mesh::{self, Elevation, TileMesh},
     sources::Source,
     tiles::Tiles,
 };
 
 /// The most meshes being built at once.
 const MAX_BUILDING: usize = 48;
-/// Tiles not wanted for this many frames are dropped.
-const EVICT_FRAMES: u64 = 180;
+/// Tiles not wanted for this many seconds are dropped, along with their meshes.
+const EVICT_SECONDS: f64 = 5.0;
 /// A split tile is only merged again once its detail drops this much below the threshold,
 /// so that tiles at the threshold do not alternate between levels.
 const SPLIT_HYSTERESIS: f64 = 0.8;
@@ -51,6 +57,21 @@ const SPLIT_HYSTERESIS: f64 = 0.8;
 const SETTLE_FRAMES: u64 = 2;
 /// Color of tiles without any imagery yet.
 const PLACEHOLDER: Color = Color::srgb(0.18, 0.22, 0.28);
+/// Seconds over which a tile fades in from its parent, or out into it, and from one imagery to
+/// the next.
+const FADE_SECONDS: f32 = 0.5;
+/// A split tile whose detail drops below this fraction of the threshold merges without fading
+/// out its children, which are then too small for it to show. This lets the level of detail
+/// keep up with a camera moving away quickly.
+const MERGE_AT_ONCE: f64 = 0.25;
+/// A tile coarser than it should be fades in faster, by how many times coarser it is, up to
+/// this much faster. The level of detail then catches up quickly with a camera moving closer,
+/// or after the start, while changes around the threshold stay gradual.
+const MAX_FADE_SPEEDUP: f64 = 8.0;
+/// For this many seconds after a tile came into view, it refines without fading, so that
+/// terrain the camera turns to appears with the most detail available, also while its finer
+/// meshes are still being built.
+const APPEAR_SECONDS: f64 = 0.5;
 
 pub struct TerrainPlugin;
 
@@ -123,10 +144,49 @@ struct Node {
     bounds: Bounds,
     built: Option<Built>,
     task: Option<Task<TileMesh>>,
-    imagery: Option<(Source, TileId)>,
-    wanted: u64,
+    /// The imagery the tile is drawn with, which its material keeps alive, and the imagery it
+    /// is blending in from.
+    imagery: Option<Shown>,
+    fade: Option<Fade>,
+    /// How far the tile has faded in from its parent, from `0`, where it looks like its
+    /// parent, to `1`.
+    morph: f32,
+    /// The time the tile was last wanted, in seconds.
+    wanted: f64,
+    /// The last frame in which the tile was in view.
+    visited: u64,
+    /// When the tile came into view, in seconds.
+    appeared: f64,
     /// Whether the tile was drawn as its children in the last frame.
     split: bool,
+    /// Whether the tile is drawn in this frame, but was not in the last.
+    fresh: bool,
+    /// Which edges border a coarser tile, and are moved onto it, see [`coarser_edges`].
+    edges: [bool; 4],
+    /// What the material was last set to, so that it is only written when that changes.
+    drawn: Option<Drawn>,
+}
+
+#[derive(Clone)]
+struct Shown {
+    key: Key,
+    image: Handle<Image>,
+}
+
+/// Blending from one imagery into the next.
+struct Fade {
+    /// The previous imagery, or the placeholder.
+    from: Option<Shown>,
+    progress: f32,
+}
+
+#[derive(PartialEq)]
+struct Drawn {
+    imagery: Option<Key>,
+    previous: Option<Key>,
+    morph: f32,
+    fade: f32,
+    edges: [bool; 4],
 }
 
 struct Built {
@@ -134,8 +194,10 @@ struct Built {
     material: Handle<TerrainMaterial>,
     center: DVec3,
     heights: (f32, f32),
-    /// The elevation tile of the latest mesh, which may still be waiting to be swapped in.
+    /// The elevation tile of the latest mesh, which may still be waiting to be swapped in, and
+    /// how many of its neighbours it was built with.
     elevation: Option<TileId>,
+    neighbours: usize,
     /// The frame from which the mesh can be drawn.
     ready: u64,
     swap: Option<Swap>,
@@ -155,8 +217,15 @@ impl Node {
             built: None,
             task: None,
             imagery: None,
-            wanted: 0,
+            fade: None,
+            morph: 1.0,
+            wanted: 0.0,
+            visited: 0,
+            appeared: f64::NEG_INFINITY,
             split: false,
+            fresh: false,
+            edges: [false; 4],
+            drawn: None,
         }
     }
 
@@ -225,10 +294,14 @@ struct Eye {
     threshold: f64,
     anisotropy: f64,
     imagery: Source,
+    /// How far tiles fade in or out in this frame.
+    fade_step: f32,
+    /// Seconds since the start.
+    now: f64,
 }
 
 impl Eye {
-    fn new(view: &View, settings: &TerrainSettings) -> Self {
+    fn new(view: &View, settings: &TerrainSettings, dt: f32, now: f64) -> Self {
         let (lon_lat, height) = view.geodetic();
         let (forward, right) = (view.forward, view.right());
         let up = right.cross(forward);
@@ -252,6 +325,8 @@ impl Eye {
             threshold: settings.lod_threshold,
             anisotropy: settings.anisotropy,
             imagery: settings.imagery,
+            fade_step: dt / FADE_SECONDS,
+            now,
         }
     }
 
@@ -303,17 +378,21 @@ impl Eye {
 }
 
 impl Terrain {
+    /// Select the tiles to draw within `tile`. While `merging`, its parent is waiting for it to
+    /// fade out.
     fn visit(
         &mut self,
         eye: &Eye,
         tiles: &mut Tiles,
         tile: TileId,
         heights: (f32, f32),
+        merging: bool,
         out: &mut Vec<TileId>,
     ) {
         let frame = self.frame;
         let node = self.nodes.entry(tile).or_insert_with(|| Node::new(tile));
-        node.wanted = frame;
+        node.wanted = eye.now;
+        node.visited = frame;
         let heights = node.heights(heights);
         let (distance, detail) = eye.detail(tile, &node.bounds, heights);
 
@@ -324,12 +403,25 @@ impl Terrain {
         let elevation = mesh::elevation_tile(tile, Source::Terrain.max_zoom());
         tiles.request((Source::Terrain, elevation), distance as f32);
 
-        // Rebuild the mesh when better elevation data is available
+        // Rebuild the mesh when better elevation data is available, or more of the data around
+        // it, which its edges are interpolated with
         if node.task.is_none() {
-            let best = tiles.best_elevation(elevation).map(|(id, _)| id.zoom);
+            let best = tiles.best_elevation(elevation).map(|(id, _)| id);
             let rebuild = match &node.built {
                 None => Some(false),
-                Some(built) if best > built.elevation.map(|id| id.zoom) => Some(true),
+                Some(built) if best.map(|id| id.zoom) > built.elevation.map(|id| id.zoom) => {
+                    Some(true)
+                }
+                Some(built)
+                    if best.is_some_and(|id| {
+                        let around = Elevation::neighbour_ids(id)
+                            .filter(|(_, id)| tiles.has_elevation(*id))
+                            .count();
+                        best == built.elevation && around > built.neighbours
+                    }) =>
+                {
+                    Some(true)
+                }
                 Some(_) => None,
             };
             if let Some(rebuild) = rebuild {
@@ -342,19 +434,26 @@ impl Terrain {
             }
         }
         let ready = node.ready(frame);
-        let threshold = match node.split {
+        let (split, morph) = (node.split, node.morph);
+        let threshold = match split {
             true => eye.threshold * SPLIT_HYSTERESIS,
             false => eye.threshold,
         };
+        let refine = tile.zoom < eye.imagery.max_zoom() && detail > threshold;
+        // Only a tile that has faded in splits, so that its children fade in from what is
+        // drawn. A split tile that no longer needs its children keeps them while they fade out.
+        let fade_out = split && !refine && detail > eye.threshold * MERGE_AT_ONCE;
 
-        if tile.zoom < eye.imagery.max_zoom() && detail > threshold {
+        if (refine && (split || morph >= 1.0)) || fade_out {
             let children = tile.children();
             let mut visible = [false; 4];
             let mut children_ready = true;
+            let mut faded_out = true;
             for (i, child) in children.into_iter().enumerate() {
                 let node = self.nodes.entry(child).or_insert_with(|| Node::new(child));
-                node.wanted = frame;
+                node.wanted = eye.now;
                 visible[i] = eye.visible(child, &node.bounds, node.heights(heights));
+                faded_out &= !visible[i] || (!node.split && node.morph <= 0.0);
                 if !node.ready(frame) {
                     children_ready = false;
                     if node.built.is_none() && node.task.is_none() {
@@ -367,10 +466,39 @@ impl Terrain {
                     }
                 }
             }
-            if children_ready {
+            if children_ready && !(fade_out && faded_out) {
+                // Children only fade in where the tile was on screen, and had been for a moment.
+                // Where the camera just turned to, they appear at once.
+                let appeared = self.nodes.get(&tile).map_or(0.0, |node| node.appeared);
+                let on_screen =
+                    self.rendered.contains(&tile) && eye.now - appeared >= APPEAR_SECONDS;
+                for (child, visible) in children.into_iter().zip(visible) {
+                    let Some(node) = self.nodes.get_mut(&child) else {
+                        continue;
+                    };
+                    let entering = visible && node.visited + 1 < frame;
+                    if !split {
+                        node.morph = if on_screen && visible { 0.0 } else { 1.0 };
+                        node.appeared = appeared;
+                    } else if entering {
+                        // Drawn the way the rest of the tile is, which is faded out into the
+                        // tile when it is merging
+                        node.morph = if fade_out { 0.0 } else { 1.0 };
+                        node.appeared = eye.now;
+                    }
+                }
+                if fade_out {
+                    // The children fade out into the imagery the tile will be drawn with
+                    let best = tiles.best_imagery(eye.imagery, tile);
+                    if let Some(node) = self.nodes.get_mut(&tile)
+                        && let Some(best) = better_imagery(&node.imagery, eye.imagery, best)
+                    {
+                        node.imagery = best;
+                    }
+                }
                 self.set_split(tile, true);
                 for (child, _) in children.into_iter().zip(visible).filter(|(_, v)| *v) {
-                    self.visit(eye, tiles, child, heights, out);
+                    self.visit(eye, tiles, child, heights, fade_out, out);
                 }
                 return;
             }
@@ -378,6 +506,18 @@ impl Terrain {
 
         self.set_split(tile, false);
         if ready {
+            let fresh = !self.rendered.contains(&tile);
+            if let Some(node) = self.nodes.get_mut(&tile) {
+                let (target, step) = match merging {
+                    true => (0.0, eye.fade_step),
+                    false => {
+                        let speedup = (detail / eye.threshold).clamp(1.0, MAX_FADE_SPEEDUP);
+                        (1.0, eye.fade_step * speedup as f32)
+                    }
+                };
+                node.morph += (target - node.morph).clamp(-step, step);
+                node.fresh = fresh;
+            }
             out.push(tile);
         }
     }
@@ -408,18 +548,30 @@ impl Terrain {
             if node.task.is_some() {
                 continue;
             }
-            let elevation =
-                tiles.best_elevation(mesh::elevation_tile(tile, Source::Terrain.max_zoom()));
+            let elevation = elevation_of(tiles, tile);
             if let Some(built) = &node.built
-                && built.elevation == elevation.as_ref().map(|(id, _)| *id)
+                && built.elevation == elevation.as_ref().map(|e| e.id)
+                && built.neighbours == elevation.as_ref().map_or(0, Elevation::neighbours)
             {
                 continue;
             }
-            node.task = Some(pool.spawn(async move { mesh::build_tile_mesh(tile, elevation) }));
+            // What the parent is drawn with, to fade in from
+            let parent_elevation = tile.parent().and_then(|parent| elevation_of(tiles, parent));
+            node.task =
+                Some(pool.spawn(async move {
+                    mesh::build_tile_mesh(tile, elevation, parent_elevation)
+                }));
             self.building += 1;
         }
         self.queue = queue;
     }
+}
+
+/// The best elevation data available for a tile, with that around it.
+fn elevation_of(tiles: &mut Tiles, tile: TileId) -> Option<Elevation> {
+    let (id, grid) =
+        tiles.best_elevation(mesh::elevation_tile(tile, Source::Terrain.max_zoom()))?;
+    Some(Elevation::new(id, grid, |id| tiles.elevation_grid(id)))
 }
 
 fn select_tiles(
@@ -427,27 +579,29 @@ fn select_tiles(
     mut tiles: ResMut<Tiles>,
     view: Res<View>,
     settings: Res<TerrainSettings>,
+    time: Res<Time>,
 ) {
     let terrain = terrain.as_mut();
     terrain.frame += 1;
     if settings.freeze {
         // Keep the drawn tiles and their data
-        let frame = terrain.frame;
+        let now = time.elapsed_secs_f64();
         for tile in &terrain.rendered {
             if let Some(node) = terrain.nodes.get_mut(tile) {
-                node.wanted = frame;
+                node.wanted = now;
             }
         }
         return;
     }
 
-    let eye = Eye::new(&view, &settings);
+    let eye = Eye::new(&view, &settings, time.delta_secs(), time.elapsed_secs_f64());
     let mut rendered = Vec::new();
     terrain.visit(
         &eye,
         &mut tiles,
         TileId::ROOT,
         (0.0, MAX_HEIGHT),
+        false,
         &mut rendered,
     );
     terrain.start_builds(&mut tiles);
@@ -463,7 +617,36 @@ fn select_tiles(
         })
         .count();
     terrain.stats.max_zoom = current.iter().map(|t| t.zoom).max().unwrap_or(0);
+    for tile in &current {
+        let edges = coarser_edges(*tile, &current);
+        if let Some(node) = terrain.nodes.get_mut(tile) {
+            node.edges = edges;
+        }
+    }
     terrain.rendered = current;
+}
+
+/// Which edges of a drawn tile border a coarser drawn tile, in the order of the texture
+/// coordinates: `u = 0`, `u = 1`, `v = 0` and `v = 1`. The coarser tile covers the whole edge.
+fn coarser_edges(tile: TileId, rendered: &HashSet<TileId>) -> [bool; 4] {
+    let beyond = |u: f64, v: f64| {
+        let unit = tile.unit(u, v);
+        if !(0.0..1.0).contains(&unit.y) {
+            return false;
+        }
+        let unit = DVec2::new(unit.x.rem_euclid(1.0), unit.y);
+        TileId::containing(unit, tile.zoom)
+            .lineage()
+            .find(|t| rendered.contains(t))
+            .is_some_and(|neighbour| neighbour.zoom < tile.zoom)
+    };
+    const OUT: f64 = 1e-3;
+    [
+        beyond(-OUT, 0.5),
+        beyond(1.0 + OUT, 0.5),
+        beyond(0.5, -OUT),
+        beyond(0.5, 1.0 + OUT),
+    ]
 }
 
 fn poll_meshes(
@@ -483,7 +666,7 @@ fn poll_meshes(
         terrain.building -= 1;
 
         let mesh = meshes.add(tile_mesh.mesh);
-        let planet_center = (-tile_mesh.center).as_vec3().extend(0.0);
+        let planet_center = (-tile_mesh.center).as_vec3();
         let heights = (tile_mesh.min_height, tile_mesh.max_height);
         let ready = terrain.frame + SETTLE_FRAMES;
 
@@ -491,6 +674,7 @@ fn poll_meshes(
             // The origin of a tile never changes, so only the mesh needs to be swapped
             Some(built) => {
                 built.elevation = tile_mesh.elevation;
+                built.neighbours = tile_mesh.neighbours;
                 built.swap = Some(Swap {
                     mesh,
                     heights,
@@ -499,13 +683,9 @@ fn poll_meshes(
             }
             None => {
                 let material = materials.add(TerrainMaterial {
-                    params: TerrainParams {
-                        uv_transform: Vec4::new(0.0, 0.0, 1.0, 0.0),
-                        planet_center,
-                        base_color: PLACEHOLDER.to_linear().to_vec4(),
-                        sun: sun.direction().extend(0.0),
-                    },
+                    params: TerrainParams::new(planet_center, PLACEHOLDER, sun.direction()),
                     imagery: None,
+                    previous: None,
                 });
                 let entity = commands
                     .spawn((
@@ -524,10 +704,11 @@ fn poll_meshes(
                     center: tile_mesh.center,
                     heights,
                     elevation: tile_mesh.elevation,
+                    neighbours: tile_mesh.neighbours,
                     ready,
                     swap: None,
                 });
-                node.imagery = None;
+                node.drawn = None;
             }
         }
     }
@@ -542,6 +723,7 @@ fn update_tiles(
     view: Res<View>,
     settings: Res<TerrainSettings>,
     sun: Res<Sun>,
+    time: Res<Time>,
 ) {
     let terrain = terrain.as_mut();
     let frame = terrain.frame;
@@ -569,48 +751,85 @@ fn update_tiles(
         let Ok((mut transform, mut visibility)) = entities.get_mut(built.entity) else {
             continue;
         };
-
         if !terrain.rendered.contains(tile) {
             visibility.set_if_neq(Visibility::Hidden);
             continue;
         }
         visibility.set_if_neq(Visibility::Visible);
         transform.translation = (built.center - view.position).as_vec3();
+    }
 
-        // The material keeps its imagery alive, so a tile never reverts to coarser imagery
-        // because it was evicted from the store
-        let best = tiles.best_imagery(settings.imagery, *tile);
-        let best_id = best.as_ref().map(|(id, _)| (settings.imagery, *id));
-        let coarser = match (node.imagery, best_id) {
-            (Some((source, current)), best) => {
-                source == settings.imagery && best.is_none_or(|(_, best)| best.zoom < current.zoom)
-            }
-            (None, _) => false,
+    let fade_step = time.delta_secs() / FADE_SECONDS;
+    let now = time.elapsed_secs_f64();
+    for tile in &terrain.rendered {
+        let parent = tile
+            .parent()
+            .and_then(|parent| terrain.nodes.get(&parent))
+            .and_then(|parent| parent.imagery.clone());
+        let Some(node) = terrain.nodes.get_mut(tile) else {
+            continue;
         };
-        if best_id != node.imagery
-            && !coarser
-            && let Some(mut material) = materials.get_mut(&built.material)
+        let Some(built) = &node.built else {
+            continue;
+        };
+
+        // A tile that just appeared takes the best imagery at once, as it either fades in from
+        // its parent, appears where its children faded out into it, or has just come into
+        // view. Otherwise the tile blends into better imagery, once it has faded in.
+        let best = tiles.best_imagery(settings.imagery, *tile);
+        let better = better_imagery(&node.imagery, settings.imagery, best);
+        if node.fresh || now - node.appeared < APPEAR_SECONDS {
+            node.fade = None;
+            if let Some(better) = better {
+                node.imagery = better;
+            }
+        } else if node.morph >= 1.0
+            && let Some(better) = better
         {
-            node.imagery = best_id;
-            match best {
-                Some((id, image)) => {
-                    let (offset, scale) = tile.uv_in_ancestor(id);
-                    material.params.uv_transform =
-                        Vec4::new(offset.x as f32, offset.y as f32, scale as f32, 0.0);
-                    material.params.base_color = Vec4::ONE;
-                    material.imagery = Some(image);
-                }
-                None => {
-                    material.params.base_color = PLACEHOLDER.to_linear().to_vec4();
-                    material.imagery = None;
-                }
+            let from = std::mem::replace(&mut node.imagery, better);
+            node.fade = Some(Fade {
+                from,
+                progress: 0.0,
+            });
+        }
+        if let Some(fade) = &mut node.fade {
+            fade.progress += fade_step;
+            if fade.progress >= 1.0 {
+                node.fade = None;
             }
         }
+
+        let (previous, weight) = match &node.fade {
+            _ if node.morph < 1.0 => (parent, node.morph),
+            Some(fade) => (fade.from.clone(), fade.progress),
+            None => (None, 1.0),
+        };
+        let drawn = Drawn {
+            imagery: node.imagery.as_ref().map(|shown| shown.key),
+            previous: previous.as_ref().map(|shown| shown.key),
+            morph: node.morph,
+            edges: node.edges,
+            fade: weight,
+        };
+        if node.drawn.as_ref() == Some(&drawn) {
+            continue;
+        }
+        let Some(mut material) = materials.get_mut(&built.material) else {
+            continue;
+        };
+        let params = &mut material.params;
+        (params.uv_transform, params.base_color) = imagery_params(*tile, &node.imagery);
+        (params.previous_uv_transform, params.previous_color) = imagery_params(*tile, &previous);
+        params.fade = Vec4::new(ease(node.morph), ease(weight), 0.0, 0.0);
+        params.edges = Vec4::from_array(node.edges.map(|edge| edge as u8 as f32));
+        material.imagery = node.imagery.as_ref().map(|shown| shown.image.clone());
+        material.previous = previous.map(|shown| shown.image);
+        node.drawn = Some(drawn);
     }
 
     // Drop tiles which have not been wanted for a while
     terrain.nodes.retain(|tile, node| {
-        let keep = tile.zoom <= 2 || frame.saturating_sub(node.wanted) < EVICT_FRAMES;
+        let keep = tile.zoom <= 2 || time.elapsed_secs_f64() - node.wanted < EVICT_SECONDS;
         if !keep {
             if let Some(built) = &node.built {
                 commands.entity(built.entity).despawn();
@@ -625,6 +844,51 @@ fn update_tiles(
     terrain.stats.rendered = terrain.rendered.len();
     terrain.stats.nodes = terrain.nodes.len();
     terrain.stats.building = terrain.building;
+}
+
+/// The imagery to replace `current` with, if `best` is better. The material of a tile keeps
+/// its imagery alive, so a tile never reverts to coarser imagery because it was evicted from
+/// the store, unless the source changed.
+fn better_imagery(
+    current: &Option<Shown>,
+    source: Source,
+    best: Option<(TileId, Handle<Image>)>,
+) -> Option<Option<Shown>> {
+    let best = best.map(|(id, image)| Shown {
+        key: (source, id),
+        image,
+    });
+    let (current, best_key) = (
+        current.as_ref().map(|c| c.key),
+        best.as_ref().map(|b| b.key),
+    );
+    let coarser = current.is_some_and(|(current_source, current)| {
+        current_source == source && best_key.is_none_or(|(_, best)| best.zoom < current.zoom)
+    });
+    (best_key != current && !coarser).then_some(best)
+}
+
+/// The texture transform and color of a tile drawn with some imagery, or the placeholder.
+fn imagery_params(tile: TileId, imagery: &Option<Shown>) -> (Vec4, Vec4) {
+    match imagery {
+        Some(Shown { key: (_, id), .. }) => {
+            let (offset, scale) = tile.uv_in_ancestor(*id);
+            (
+                Vec4::new(offset.x as f32, offset.y as f32, scale as f32, 0.0),
+                Vec4::ONE,
+            )
+        }
+        None => (
+            Vec4::new(0.0, 0.0, 1.0, 0.0),
+            PLACEHOLDER.to_linear().to_vec4(),
+        ),
+    }
+}
+
+/// Eases in and out of fades.
+fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// One of the caps closing the globe beyond the reach of the Web Mercator tiles.
@@ -651,13 +915,9 @@ fn spawn_caps(
     for north in [true, false] {
         let (mesh, center) = mesh::build_cap_mesh(north, |_| 0.0);
         let material = materials.add(TerrainMaterial {
-            params: TerrainParams {
-                uv_transform: Vec4::new(0.0, 0.0, 1.0, 0.0),
-                planet_center: (-center).as_vec3().extend(0.0),
-                base_color: Vec4::ONE,
-                sun: sun.direction().extend(0.0),
-            },
+            params: TerrainParams::new((-center).as_vec3(), Color::WHITE, sun.direction()),
             imagery: None,
+            previous: None,
         });
         commands.spawn((
             Mesh3d(meshes.add(mesh)),

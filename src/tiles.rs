@@ -117,6 +117,18 @@ impl Tiles {
             })
     }
 
+    /// The height data of exactly this tile, if it is loaded.
+    pub fn elevation_grid(&mut self, tile: TileId) -> Option<Arc<HeightGrid>> {
+        let frame = self.frame;
+        let stored = self.elevation.get_mut(&tile)?;
+        stored.used = frame;
+        Some(stored.value.clone())
+    }
+
+    pub fn has_elevation(&self, tile: TileId) -> bool {
+        self.elevation.contains_key(&tile)
+    }
+
     /// The height of the terrain at a longitude and latitude, using the best data available
     /// up to `max_zoom`.
     pub fn height_at(&self, lon_lat: DVec2, max_zoom: u8) -> Option<f32> {
