@@ -59,31 +59,38 @@ pub(super) fn draw(
     let at = |point: DVec3| (flight.to_ecef(point) - view.position).as_vec3();
     let dir = |vector: DVec3| (attitude * vector).as_vec3();
 
-    // Arrows are scaled so that the weight spread over all strips gives arrows a tenth of the
-    // span long
+    // The strips and body cells draw their forces per meter of span or length, so that the
+    // arrows do not depend on how finely the aircraft is divided, and their tips trace the
+    // distribution of the load. The weight spread evenly over the span gives arrows a tenth of
+    // the span long. Point forces, such as of landing gear, draw as if spread over a twentieth
+    // of the span.
     let strips = &model.aero.strips;
-    let span = strips
+    let span = (strips
         .iter()
         .map(|s| s.a.y.abs().max(s.b.y.abs()))
         .fold(0.0, f64::max)
-        * 2.0;
+        * 2.0)
+        .max(0.5);
     let weight = model.config.mass * 9.81;
-    let strip_scale = 0.1 * span.max(0.5) * strips.len().max(1) as f64 / weight;
-    let total_scale = 0.3 * span.max(0.5) / weight;
+    let load_scale = 0.1 * span * span / weight;
+    let point_scale = load_scale * 20.0 / span;
+    let total_scale = 0.3 * span / weight;
 
     if debug.forces {
         let loads = &snapshot.loads;
         for (strip, load) in strips.iter().zip(&loads.aero.strips) {
             let p = at(strip.center);
             let color = if load.separation > 0.5 { STALLED } else { LIFT };
-            arrow(&mut gizmos, p, dir(load.lift * strip_scale), color);
-            arrow(&mut gizmos, p, dir(load.drag * strip_scale), DRAG);
+            // Its width across the chord
+            let scale = load_scale * strip.chord / strip.area.max(1e-9);
+            arrow(&mut gizmos, p, dir(load.lift * scale), color);
+            arrow(&mut gizmos, p, dir(load.drag * scale), DRAG);
         }
         for (cell, force) in model.aero.cells.iter().zip(&loads.aero.cells) {
             arrow(
                 &mut gizmos,
                 at(cell.center),
-                dir(*force * strip_scale),
+                dir(*force * (load_scale / cell.length.max(1e-9))),
                 BODY,
             );
         }
@@ -93,7 +100,7 @@ pub(super) fn draw(
             .iter()
             .zip(&loads.aero.drag_elements)
         {
-            arrow(&mut gizmos, at(*position), dir(*force * strip_scale), BODY);
+            arrow(&mut gizmos, at(*position), dir(*force * point_scale), BODY);
         }
         for (rotor, force) in model.rotors.iter().zip(&loads.rotors) {
             arrow(

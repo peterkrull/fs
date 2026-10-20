@@ -32,7 +32,7 @@ back. Touching the terrain stops it, until reset.
 | Tab | switch between the chase camera and the free camera |
 | Mouse | orbit the chase camera (click to capture, Esc to release, or hold the right button) |
 | Scroll | zoom the chase camera |
-| F1 | force arrows: lift (green, red when stalled), drag (magenta), bodies (blue), thrust (yellow), and the total lift at the center of lift (cyan) |
+| F1 | force arrows: lift (green, red when stalled) and drag (magenta) per meter of span, bodies (blue) per meter of length, thrust (yellow), and the total lift at the center of lift (cyan) |
 | F2 | the aerodynamic model: strips, control surfaces as deflected, bound vortices, body cells, rotor discs, center of gravity |
 | F3 | hide the 3D model |
 
