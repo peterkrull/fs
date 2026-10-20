@@ -25,7 +25,7 @@ use crate::{
     options::Options,
     sim::{
         Simulation, Status,
-        config::{AircraftConfig, Sticks},
+        config::{AircraftConfig, Sticks, Watcher},
         runner::{Mode, Request, SimHandle, Snapshot},
     },
     tiles::Tiles,
@@ -55,17 +55,35 @@ impl Plugin for FlightPlugin {
             info!("{}", arduplane_command(path, options, port));
         }
 
+        // Far enough behind to see the whole aircraft
+        let span = flight
+            .model
+            .aero
+            .strips
+            .iter()
+            .map(|s| s.a.y.abs().max(s.b.y.abs()))
+            .fold(0.0, f64::max)
+            * 2.0;
+        app.insert_resource(Chase {
+            distance: (1.5 * span).max(Chase::default().distance),
+            ..default()
+        });
         app.insert_resource(flight)
+            .add_message::<AircraftReloaded>()
             .insert_resource(options.radio.unwrap_or_default())
             .insert_resource(CameraMode::Chase)
             .init_resource::<Pilot>()
-            .init_resource::<Chase>()
             .init_resource::<DebugView>()
             .add_systems(Startup, (visual::spawn, spawn_panel, debug::startup))
             .add_systems(
                 Update,
                 (
-                    (take_snapshot, keys.run_if(resource_exists::<Controls>))
+                    (
+                        reload,
+                        visual::spawn.run_if(on_message::<AircraftReloaded>),
+                        take_snapshot,
+                        keys.run_if(resource_exists::<Controls>),
+                    )
                         .chain()
                         .before(CameraSystems),
                     (chase, keep_in_view).chain().in_set(CameraSystems),
@@ -101,26 +119,53 @@ fn arduplane_command(aircraft: &std::path::Path, options: &Options, port: u16) -
     )
 }
 
+/// How often the aircraft definition is checked for changes, in seconds.
+const RELOAD_INTERVAL: f32 = 0.25;
+
+/// Sent when the aircraft was reloaded from its edited definition.
+#[derive(Message)]
+pub struct AircraftReloaded;
+
 /// The simulation, and a copy of its aircraft on the main thread to look up its geometry.
 #[derive(Resource)]
 pub struct Flight {
     handle: SimHandle,
     pub model: Simulation,
     pub snapshot: Snapshot,
+    watcher: Watcher,
+    options: Options,
+    /// Why the edited definition could not be loaded, until it can.
+    reload_error: Option<String>,
 }
 
 impl Flight {
     fn new(path: &std::path::Path, options: &Options) -> Result<Self, String> {
+        let watcher = Watcher::new(path);
         let config = AircraftConfig::load(path)?;
-        let model = Simulation::new(config.clone(), options.spawn, Box::new(options.wind))?;
-        let simulation = Simulation::new(config, options.spawn, Box::new(options.wind))?;
+        let spawn = options.spawn_for(&config);
+        let model = Simulation::new(config.clone(), spawn, Box::new(options.wind))?;
+        let simulation = Simulation::new(config, spawn, Box::new(options.wind))?;
         let handle = SimHandle::spawn(simulation, options.mode).map_err(|err| format!("{err}"))?;
         let snapshot = handle.snapshot();
         Ok(Self {
             handle,
             model,
             snapshot,
+            watcher,
+            options: options.clone(),
+            reload_error: None,
         })
+    }
+
+    /// Carry on with another aircraft, from where the current one is.
+    fn replace_aircraft(&mut self, config: AircraftConfig) -> Result<(), String> {
+        let spawn = self.options.spawn_for(&config);
+        let wind = Box::new(self.options.wind);
+        let model = Simulation::new(config.clone(), spawn, wind.clone())?;
+        let simulation = Simulation::new(config, spawn, wind)?;
+        self.handle.replace_aircraft(simulation);
+        self.model = model;
+        Ok(())
     }
 
     pub fn request(&self, request: Request) {
@@ -131,6 +176,35 @@ impl Flight {
     pub fn to_ecef(&self, point: DVec3) -> DVec3 {
         let body = &self.snapshot.body;
         body.position + body.attitude * (point - self.model.center_of_gravity)
+    }
+}
+
+/// Load the aircraft again whenever its definition is saved. A definition with errors is
+/// reported, and the aircraft flies on as it was.
+fn reload(
+    time: Res<Time>,
+    mut next: Local<f32>,
+    mut flight: ResMut<Flight>,
+    mut reloaded: MessageWriter<AircraftReloaded>,
+) {
+    let now = time.elapsed_secs();
+    if now < *next {
+        return;
+    }
+    *next = now + RELOAD_INTERVAL;
+    let Some(config) = flight.watcher.poll() else {
+        return;
+    };
+    match config.and_then(|config| flight.replace_aircraft(config)) {
+        Ok(()) => {
+            info!("Reloaded the aircraft from {:?}", flight.watcher.path());
+            flight.reload_error = None;
+            reloaded.write(AircraftReloaded);
+        }
+        Err(err) => {
+            error!("Unable to reload the aircraft: {err}");
+            flight.reload_error = Some(err);
+        }
     }
 }
 
@@ -437,8 +511,12 @@ fn update_panel(
         .collect();
     let ground_speed = DVec2::new(s.velocity_ned.x, s.velocity_ned.y).length();
 
+    let reload_error = match &flight.reload_error {
+        Some(err) => format!("\nnot reloaded: {err}"),
+        None => String::new(),
+    };
     let mut text = format!(
-        "{}\n{link}   {:.1}x real time\n{status}\n\n\
+        "{}{reload_error}\n{link}   {:.1}x real time\n{status}\n\n\
          airspeed {:.1} m/s   ground speed {:.1} m/s   climb {:+.1} m/s\n\
          altitude {:.0} m   above ground {:.0} m\n\
          roll {:+.0}   pitch {:+.0}   heading {:.0} deg\n\

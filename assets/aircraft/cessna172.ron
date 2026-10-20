@@ -1,0 +1,229 @@
+// A Cessna 172P Skyhawk at its maximum weight of 2400 lb, as delivered in 1982 to 1986, with
+// the 160 hp Lycoming O-320-D2J and a fixed pitch 75 inch McCauley propeller.
+//
+// The model frame is forward-right-down, in meters. Its origin is the datum of the Pilot's
+// Operating Handbook, the front face of the firewall, at the height of the center of gravity.
+// Stations in inches aft of the datum convert to x = -0.0254 * station.
+//
+// Sources:
+// - Pilot's Operating Handbook, Cessna 172P (1986): weights, wing area, propeller, engine,
+//   control travels, and the performance this model is compared against (tests/cessna172.rs).
+// - Jane's All the World's Aircraft 1977-78, Skyhawk II: tail, aileron and flap areas.
+// - JSBSim c172x (Tony Peden, after Cessna data and textbooks): moments of inertia, positions
+//   of the propeller and landing gear, and the propeller coefficients.
+// - NACA Report 824 (Abbott, von Doenhoff, Stivers): section data of the NACA 2412 and 0012.
+(
+    name: "Cessna 172P",
+    // 2400 lb
+    mass: 1088.6,
+    // Station 41.0, in the middle of the range at maximum weight (38.5 to 47.3)
+    center_of_gravity: (-1.041, 0.0, 0.0),
+    // JSBSim c172x: 948, 1346 and 1967 slug ft²
+    inertia: (ixx: 1285.0, iyy: 1825.0, izz: 2667.0),
+    // 97 kt, at which it is about trimmed
+    launch_speed: 50.0,
+
+    airfoils: {
+        // At a Reynolds number of about three million, as at the stall: a maximum lift
+        // coefficient of 1.5 at 13.5°
+        "naca2412": Parametric(
+            lift_slope: 5.9,
+            zero_lift_angle: -2.1,
+            cd_min: 0.008,
+            cd_k: 0.006,
+            cm: -0.045,
+            stall_positive: 16.0,
+            stall_negative: -16.0,
+            shape: (thickness: 0.12, camber: 0.02, camber_position: 0.4),
+        ),
+        "naca0012": Parametric(
+            lift_slope: 5.9,
+            cd_min: 0.009,
+            cd_k: 0.006,
+            stall_positive: 15.0,
+            stall_negative: -15.0,
+            shape: (thickness: 0.12),
+        ),
+    },
+
+    surfaces: [
+        (
+            // 174 ft² and 36 ft, with a constant chord inboard of station 100, and tapered
+            // outboard of it, with 3° of washout
+            name: "wing",
+            airfoil: "naca2412",
+            // The leading edge of the mean aerodynamic chord is at station 28.5
+            root: (-0.724, 0.0, -0.58),
+            root_chord: 1.61,
+            incidence: 1.5,
+            mirror: true,
+            sections: [
+                (
+                    span: 2.55,
+                    tip_chord: 1.61,
+                    dihedral: 1.73,
+                    cells: 8,
+                    controls: [
+                        // Single slotted flaps, 30° at most, from the cabin outwards
+                        (
+                            actuator: "flaps",
+                            deflection: 30.0,
+                            chord_fraction: 0.30,
+                            extent: (0.2, 1.0),
+                        ),
+                    ],
+                ),
+                (
+                    span: 2.94,
+                    tip_chord: 1.12,
+                    dihedral: 1.73,
+                    twist: -3.0,
+                    cells: 10,
+                    controls: [
+                        // 20° up and 15° down, here the same either way
+                        (
+                            actuator: "aileron",
+                            deflection: -17.5,
+                            chord_fraction: 0.24,
+                            extent: (0.0, 0.86),
+                            mirror: Antisymmetric,
+                        ),
+                    ],
+                ),
+            ],
+        ),
+        (
+            // 36.1 ft² over 11 ft 4 in, of which 14.5 ft² is the elevator, with the trailing
+            // edge straight
+            name: "horizontal tail",
+            airfoil: "naca0012",
+            root: (-5.50, 0.0, -0.15),
+            root_chord: 1.12,
+            incidence: -2.5,
+            mirror: true,
+            sections: [
+                (
+                    span: 1.725,
+                    tip_chord: 0.82,
+                    sweep: 9.9,
+                    cells: 5,
+                    controls: [
+                        // 28° up and 23° down
+                        (actuator: "elevator", deflection: -25.5, chord_fraction: 0.40),
+                    ],
+                ),
+            ],
+        ),
+        (
+            // 18.7 ft², of which 7.4 ft² is the rudder
+            name: "fin",
+            airfoil: "naca0012",
+            root: (-5.07, 0.0, -0.25),
+            root_chord: 1.6,
+            sections: [
+                (
+                    span: 1.5,
+                    tip_chord: 0.7,
+                    sweep: 38.0,
+                    dihedral: 90.0,
+                    cells: 5,
+                    controls: [(actuator: "rudder", deflection: 16.0, chord_fraction: 0.40)],
+                ),
+            ],
+        ),
+    ],
+
+    bodies: [
+        (
+            // From the spinner to the end of the tail cone, as a body of revolution of the
+            // same cross section as the cabin, 1.0 m wide and 1.25 m high
+            name: "fuselage",
+            nose: (1.05, 0.0, 0.1),
+            length: 7.15,
+            profile: [
+                (0.0, 0.12), (0.05, 0.38), (0.15, 0.5), (0.25, 0.6), (0.4, 0.6),
+                (0.55, 0.45), (0.75, 0.28), (1.0, 0.12),
+            ],
+            cells: 14,
+        ),
+    ],
+
+    drag: [
+        // Spring steel legs and wheels with speed fairings
+        (name: "right main gear", position: (-1.478, 1.276, 1.396), cd_area: (0.04, 0.03, 0.06)),
+        (name: "left main gear", position: (-1.478, -1.276, 1.396), cd_area: (0.04, 0.03, 0.06)),
+        (name: "nose gear", position: (0.173, 0.0, 1.435), cd_area: (0.03, 0.02, 0.03)),
+        // Faired struts from the bottom of the cabin to the wing
+        (name: "right strut", position: (-1.0, 1.55, 0.0), cd_area: (0.015, 0.01, 0.03)),
+        (name: "left strut", position: (-1.0, -1.55, 0.0), cd_area: (0.015, 0.01, 0.03)),
+        // The flow through the engine cooling, and what else sticks out, such as antennas,
+        // steps and door gaps, calibrated for 109 KTAS at 2400 rpm and 2000 ft, as in the
+        // cruise performance of the handbook
+        (name: "cooling and miscellaneous", position: (0.6, 0.0, 0.1), cd_area: (0.04, 0.0, 0.0)),
+    ],
+
+    rotors: [
+        (
+            name: "propeller",
+            // Station -37.7, 10 inches below the center of gravity
+            position: (0.958, 0.0, 0.251),
+            axis: (1.0, 0.0, 0.0),
+            diameter: 1.905,
+            // Lycoming engines turn clockwise as seen from the cockpit
+            spin: Clockwise,
+            // After JSBSim prop_75in2f, whose power coefficient agrees with the cruise
+            // performance of the handbook to within 5 % mostly. Where the handbook says
+            // otherwise, or JSBSim does not apply, the coefficients are calibrated, each against
+            // a single figure of the handbook, which tests/cessna172.rs leaves out of the
+            // comparison:
+            // - Below an advance ratio of 0.6, the power is lower, by up to 15 % when static, for
+            //   2360 rpm at full throttle on the ground, in the middle of the range in the
+            //   handbook (2300 to 2420 rpm).
+            // - Below an advance ratio of 0.7, the thrust is higher, by up to 40 % when static,
+            //   for the climb of 700 ft/min at sea level. NACA tests of similar propellers show
+            //   about as much static thrust.
+            // - Beyond an advance ratio of 1.1, where the table of JSBSim turns to reverse flow,
+            //   the power continues to fall, so that the propeller windmills, and the thrust
+            //   falls at 0.04 per 0.1 for the glide ratio of 9.1 with the propeller windmilling.
+            table: (
+                advance: [
+                    0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4,
+                    1.5, 2.0,
+                ],
+                ct: [
+                    0.1022, 0.0980, 0.0926, 0.0872, 0.0808, 0.0735, 0.0655, 0.0550, 0.0450,
+                    0.0340, 0.0240, 0.0130, -0.0060, -0.0460, -0.0860, -0.1260, -0.3260,
+                ],
+                cp: [
+                    0.0561, 0.0613, 0.0630, 0.0611, 0.0570, 0.0517, 0.0501, 0.0469, 0.0426,
+                    0.0360, 0.0282, 0.0191, 0.0100, 0.0009, -0.0082, -0.0173, -0.0400,
+                ],
+            ),
+            // The propeller (1.67 slug ft²) and the crankshaft
+            inertia: 2.5,
+            // 160 hp at 2700 rpm
+            engine: (power: 119312.0, rpm: 2700.0),
+            throttle: "throttle",
+        ),
+    ],
+
+    // As ArduPlane drives them by default, with the flaps on servo output 5. The controls are
+    // cables to the yoke and pedals, and the flaps electric, taking 4 s to extend fully.
+    actuators: [
+        (name: "aileron", channel: 1, time_constant: 0.05, slew_rate: 4.0, input: [(Roll, 1.0)]),
+        (name: "elevator", channel: 2, time_constant: 0.05, slew_rate: 4.0, input: [(Pitch, 1.0)]),
+        (
+            name: "throttle",
+            kind: Throttle,
+            channel: 3,
+            time_constant: 0.1,
+            slew_rate: 2.0,
+            input: [(Throttle, 1.0)],
+        ),
+        (name: "rudder", channel: 4, time_constant: 0.05, slew_rate: 4.0, input: [(Yaw, 1.0)]),
+        // From 0 to 1 for 0° to 30°, like a throttle
+        (name: "flaps", kind: Throttle, channel: 5, time_constant: 0.1, slew_rate: 0.25),
+    ],
+
+    visual: Generated,
+)

@@ -19,7 +19,7 @@ use bevy::math::{DMat3, DQuat, DVec2, DVec3, EulerRot};
 
 use crate::geo;
 use actuator::Actuators;
-use aero::{AeroLoads, Aerodynamics, Flow};
+use aero::{AeroLoads, Aerodynamics, Flow, Slipstream};
 use config::AircraftConfig;
 use environment::{WindField, air_density, gravity, ned_to_ecef, ned_to_ecef_at};
 use propulsion::{RotorModel, RotorState};
@@ -204,6 +204,31 @@ impl Simulation {
         self.specific_force = self.held_specific_force();
     }
 
+    /// Carry on with another aircraft, such as an edited definition of this one, from where
+    /// this one is: in flight or held, at the same time, place and attitude, in the same wind.
+    /// Actuators and rotors keep their state where their names match.
+    pub fn replace_aircraft(&mut self, mut next: Simulation) {
+        next.body = self.body;
+        next.status = self.status;
+        next.time = self.time;
+        // From the same place, but at the launch speed of the new aircraft
+        next.spawn = Spawn {
+            speed: next.spawn.speed,
+            ..self.spawn
+        };
+        next.ground = self.ground;
+        next.specific_force = self.specific_force;
+        next.battery_current = self.battery_current;
+        next.actuators.carry_over(&self.actuators);
+        for (rotor, state) in next.rotors.iter().zip(&mut next.rotor_states) {
+            if let Some(i) = self.rotors.iter().position(|r| r.name == rotor.name) {
+                *state = self.rotor_states[i];
+            }
+        }
+        std::mem::swap(&mut next.wind, &mut self.wind);
+        *self = next;
+    }
+
     /// Release the aircraft at its launch speed.
     pub fn launch(&mut self) {
         if self.status == Status::Held {
@@ -231,6 +256,7 @@ impl Simulation {
         let mut moment = DVec3::ZERO;
         let mut current = 0.0;
         let mut rotor_forces = Vec::with_capacity(self.rotors.len());
+        let mut slipstreams: Vec<Slipstream> = Vec::with_capacity(self.rotors.len());
         for (rotor, state) in self.rotors.iter().zip(&mut self.rotor_states) {
             let offset = rotor.position - self.center_of_gravity;
             let rotor_air = air - body.rates.cross(offset);
@@ -248,6 +274,7 @@ impl Simulation {
             moment += output.moment;
             current += output.current;
             rotor_forces.push(output.force);
+            slipstreams.push(output.slipstream);
         }
         self.battery_current = current;
 
@@ -256,6 +283,8 @@ impl Simulation {
             rates: body.rates,
             density,
             actuators: self.actuators.positions(),
+            dt,
+            slipstreams: &slipstreams,
         });
         force += aero.force;
         moment += aero.moment;
@@ -429,15 +458,32 @@ mod tests {
         Simulation::new(config, spawn(), Box::new(ConstantWind::default())).unwrap()
     }
 
-    /// Fly with fixed sticks, optionally rolling to keep the wings level, as a pilot would.
-    fn fly(sim: &mut Simulation, mut sticks: config::Sticks, level: bool, seconds: f64) -> Sensors {
+    /// What the pilot does while flying with otherwise fixed sticks.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Hands {
+        Off,
+        /// Roll to keep the wings level.
+        Level,
+        /// Keep the wings level, and pitch to hold this pitch angle in radians.
+        Climb(f64),
+    }
+
+    fn fly(
+        sim: &mut Simulation,
+        mut sticks: config::Sticks,
+        hands: Hands,
+        seconds: f64,
+    ) -> Sensors {
         sim.actuators.set_commands(&sim.config.mix(&sticks));
         sim.actuators.settle();
         sim.launch();
         for step in 0..(seconds * 1000.0) as usize {
-            if level && step % 10 == 0 {
+            if hands != Hands::Off && step % 10 == 0 {
                 let sensors = sim.sensors();
                 sticks.roll = -0.5 * sensors.euler.x - 0.1 * sensors.gyro.x;
+                if let Hands::Climb(pitch) = hands {
+                    sticks.pitch = 2.0 * (pitch - sensors.euler.y) - 0.3 * sensors.gyro.y;
+                }
                 sim.actuators.set_commands(&sim.config.mix(&sticks));
             }
             sim.step(STEP);
@@ -470,6 +516,8 @@ mod tests {
                     rates: DVec3::ZERO,
                     density: 1.225,
                     actuators: &actuators,
+                    dt: STEP,
+                    slipstreams: &[],
                 });
                 (-loads.force.z, loads.moment.y)
             };
@@ -493,7 +541,12 @@ mod tests {
     #[test]
     fn glides_hands_off() {
         for name in AIRCRAFT {
-            let sensors = fly(&mut aircraft(name), sticks(0.0, 0.0, 0.0, 0.0), false, 30.0);
+            let sensors = fly(
+                &mut aircraft(name),
+                sticks(0.0, 0.0, 0.0, 0.0),
+                Hands::Off,
+                30.0,
+            );
             let (roll, pitch) = (sensors.euler.x.to_degrees(), sensors.euler.y.to_degrees());
             assert!(
                 roll.abs() < 1.0 && pitch.abs() < 12.0,
@@ -520,7 +573,7 @@ mod tests {
         for name in AIRCRAFT {
             let mut sim = aircraft(name);
             sim.body.attitude *= DQuat::from_rotation_x(10f64.to_radians());
-            let sensors = fly(&mut sim, sticks(0.0, 0.0, 0.0, 0.0), false, 30.0);
+            let sensors = fly(&mut sim, sticks(0.0, 0.0, 0.0, 0.0), Hands::Off, 30.0);
             let roll = sensors.euler.x.to_degrees();
             assert!(roll.abs() < 10.0, "{name}: roll {roll}");
         }
@@ -531,7 +584,12 @@ mod tests {
     #[test]
     fn cruises_level() {
         for name in AIRCRAFT {
-            let sensors = fly(&mut aircraft(name), sticks(0.0, 0.0, 0.0, 0.6), true, 30.0);
+            let sensors = fly(
+                &mut aircraft(name),
+                sticks(0.0, 0.0, 0.0, 0.6),
+                Hands::Level,
+                30.0,
+            );
             let (roll, pitch) = (sensors.euler.x.to_degrees(), sensors.euler.y.to_degrees());
             assert!(
                 roll.abs() < 3.0 && pitch.abs() < 10.0,
@@ -550,10 +608,13 @@ mod tests {
         }
     }
 
+    /// Hands off, the flying wing pitches up into a loop at full throttle, so the pilot holds a
+    /// climbing attitude.
     #[test]
     fn full_throttle_climbs() {
         for name in AIRCRAFT {
-            let sensors = fly(&mut aircraft(name), sticks(0.0, 0.0, 0.0, 1.0), true, 20.0);
+            let climb = Hands::Climb(10f64.to_radians());
+            let sensors = fly(&mut aircraft(name), sticks(0.0, 0.0, 0.0, 1.0), climb, 20.0);
             assert!(
                 sensors.velocity_ned.z < -1.0,
                 "{name}: vertical speed {}",
@@ -566,7 +627,7 @@ mod tests {
     #[test]
     fn controls_respond() {
         for name in AIRCRAFT {
-            let rates = |sticks| fly(&mut aircraft(name), sticks, false, 0.2).gyro;
+            let rates = |sticks| fly(&mut aircraft(name), sticks, Hands::Off, 0.2).gyro;
             let pitch = rates(sticks(0.0, 0.5, 0.0, 0.6)).y;
             let roll = rates(sticks(0.5, 0.0, 0.0, 0.6)).x;
             let yaw = rates(sticks(0.0, 0.0, 0.5, 0.6)).z;
@@ -575,6 +636,30 @@ mod tests {
             assert!(roll > 0.2, "{name}: roll rate {roll}");
             assert!(yaw > 0.03, "{name}: yaw rate {yaw}");
         }
+    }
+
+    /// Reloading an aircraft carries on its flight, and keeps the state of what it shares with
+    /// the new one.
+    #[test]
+    fn replaced_aircraft_flies_on() {
+        let mut sim = aircraft("uav");
+        fly(&mut sim, sticks(0.0, 0.0, 0.0, 0.6), Hands::Off, 1.0);
+        let (body, time, rpm) = (sim.body, sim.time, sim.rotor_states[0].speed);
+        let throttle = sim.actuators.positions()[2];
+
+        let mut config = sim.config.clone();
+        config.mass *= 1.1;
+        config.actuators.swap(0, 1);
+        sim.replace_aircraft(
+            Simulation::new(config, spawn(), Box::new(ConstantWind::default())).unwrap(),
+        );
+        assert_eq!(sim.status, Status::Flying);
+        assert_eq!((sim.body.position, sim.time), (body.position, time));
+        assert_eq!(sim.rotor_states[0].speed, rpm);
+        assert_eq!(sim.actuators.positions()[2], throttle);
+        assert!((sim.mass - 2.2).abs() < 1e-9);
+        sim.step(STEP);
+        assert_eq!(sim.status, Status::Flying);
     }
 
     #[test]

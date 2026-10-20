@@ -1,0 +1,19 @@
+# ArduPlane parameters for the Cessna 172P of cessna172.ron, on top of the defaults for planes
+# (Tools/autotest/models/plane.parm in the ArduPilot repository). The flaps are on output 5.
+SERVO5_FUNCTION 2
+AIRSPEED_CRUISE 50
+AIRSPEED_MIN    35
+AIRSPEED_MAX    62
+ARSPD_USE       1
+TRIM_THROTTLE   70
+# Gentle turns, as a 172 is flown, and navigation suited to its speed
+ROLL_LIMIT_DEG  35
+NAVL1_PERIOD    25
+WP_LOITER_RAD   500
+PTCH_LIM_MAX_DEG 15
+PTCH_LIM_MIN_DEG -15
+# It climbs at 700 ft/min at best
+TECS_CLMB_MAX   3.0
+TECS_SINK_MIN   2.0
+TECS_SINK_MAX   5.0
+TECS_TIME_CONST 8

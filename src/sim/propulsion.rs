@@ -1,4 +1,4 @@
-//! Propellers and rotors driven by brushless motors.
+//! Propellers and rotors driven by brushless motors or piston engines.
 //!
 //! The speed of each rotor is a state of its own, driven by the torque of its motor against
 //! the aerodynamic torque of the propeller. This gives the throttle a realistic delay, which
@@ -8,7 +8,71 @@ use std::f64::consts::{PI, TAU};
 
 use bevy::math::DVec3;
 
-use super::config::{Rotor, Spin};
+use super::{
+    aero::Slipstream,
+    config::{Rotor, Spin},
+};
+
+/// Thrust and power coefficients by advance ratio.
+enum Coefficients {
+    /// Thrust falling linearly to zero at `zero_thrust_advance`, and power quadratically.
+    Parametric {
+        ct: f64,
+        cp: f64,
+        zero_thrust_advance: f64,
+    },
+    Table {
+        advance: Vec<f64>,
+        ct: Vec<f64>,
+        cp: Vec<f64>,
+    },
+}
+
+impl Coefficients {
+    fn at(&self, advance: f64) -> (f64, f64) {
+        match self {
+            Coefficients::Parametric {
+                ct,
+                cp,
+                zero_thrust_advance,
+            } => {
+                let ratio = advance.max(0.0) / zero_thrust_advance;
+                (
+                    ct * (1.0 - ratio).max(-0.5),
+                    cp * (1.0 - 0.6 * ratio * ratio).max(0.1),
+                )
+            }
+            Coefficients::Table {
+                advance: js,
+                ct,
+                cp,
+            } => {
+                let clamped = advance.clamp(js[0], js[js.len() - 1]);
+                let i = js.partition_point(|j| *j <= clamped).clamp(1, js.len() - 1);
+                let t = (clamped - js[i - 1]) / (js[i] - js[i - 1]);
+                let lerp = |v: &[f64]| v[i - 1] + (v[i] - v[i - 1]) * t;
+                (lerp(ct), lerp(cp))
+            }
+        }
+    }
+}
+
+/// What turns the rotor.
+enum Drive {
+    /// A brushless motor, with its speed controller as an ideal voltage source.
+    Electric {
+        /// Speed constant in rad/s per volt.
+        kv: f64,
+        resistance: f64,
+        no_load_current: f64,
+    },
+    /// A piston engine, with its torque at full throttle and its rated speed in rad/s.
+    Piston {
+        torque: f64,
+        speed: f64,
+        friction: f64,
+    },
+}
 
 pub struct RotorModel {
     pub name: String,
@@ -17,14 +81,9 @@ pub struct RotorModel {
     pub diameter: f64,
     /// `1` if the rotor turns positively about its axis, `-1` otherwise.
     pub spin: f64,
-    ct: f64,
-    cp: f64,
-    zero_thrust_advance: f64,
+    coefficients: Coefficients,
     pub inertia: f64,
-    /// Speed constant in rad/s per volt.
-    kv: f64,
-    resistance: f64,
-    no_load_current: f64,
+    drive: Drive,
     pub throttle: usize,
 }
 
@@ -36,6 +95,8 @@ pub struct RotorState {
     pub angle: f64,
     pub current: f64,
     pub thrust: f64,
+    /// Torque of the motor or engine on the rotor, in N m.
+    pub torque: f64,
 }
 
 pub struct RotorOutput {
@@ -44,13 +105,57 @@ pub struct RotorOutput {
     pub moment: DVec3,
     /// Current drawn from the battery.
     pub current: f64,
+    pub slipstream: Slipstream,
 }
 
 impl RotorModel {
     pub fn new(config: &Rotor, throttle: usize) -> Result<Self, String> {
+        let error = |message: &str| format!("rotor {}: {message}", config.name);
         let axis = DVec3::from(config.axis)
             .try_normalize()
-            .ok_or_else(|| format!("rotor {}: the axis must not be zero", config.name))?;
+            .ok_or_else(|| error("the axis must not be zero"))?;
+        let coefficients = match &config.table {
+            Some(table) => {
+                let n = table.advance.len();
+                if n < 2 || table.ct.len() != n || table.cp.len() != n {
+                    return Err(error(
+                        "propeller tables need at least two rows of equal length",
+                    ));
+                }
+                if table.advance.windows(2).any(|w| w[1] <= w[0]) {
+                    return Err(error("propeller table advance ratios must be increasing"));
+                }
+                Coefficients::Table {
+                    advance: table.advance.clone(),
+                    ct: table.ct.clone(),
+                    cp: table.cp.clone(),
+                }
+            }
+            None if config.ct > 0.0 && config.cp > 0.0 && config.zero_thrust_advance > 0.0 => {
+                Coefficients::Parametric {
+                    ct: config.ct,
+                    cp: config.cp,
+                    zero_thrust_advance: config.zero_thrust_advance,
+                }
+            }
+            None => return Err(error("needs ct, cp and zero_thrust_advance, or a table")),
+        };
+        let drive = match (&config.motor, &config.engine) {
+            (Some(motor), None) => Drive::Electric {
+                kv: motor.kv * TAU / 60.0,
+                resistance: motor.resistance,
+                no_load_current: motor.no_load_current,
+            },
+            (None, Some(engine)) => {
+                let speed = engine.rpm * TAU / 60.0;
+                Drive::Piston {
+                    torque: engine.power / speed,
+                    speed,
+                    friction: engine.friction,
+                }
+            }
+            _ => return Err(error("needs either a motor or an engine")),
+        };
         Ok(Self {
             name: config.name.clone(),
             position: DVec3::from(config.position),
@@ -61,13 +166,9 @@ impl RotorModel {
                 Spin::Clockwise => 1.0,
                 Spin::CounterClockwise => -1.0,
             },
-            ct: config.ct,
-            cp: config.cp,
-            zero_thrust_advance: config.zero_thrust_advance,
+            coefficients,
             inertia: config.inertia,
-            kv: config.motor.kv * TAU / 60.0,
-            resistance: config.motor.resistance,
-            no_load_current: config.motor.no_load_current,
+            drive,
             throttle,
         })
     }
@@ -77,8 +178,8 @@ impl RotorModel {
         self.axis * (self.inertia * state.speed * self.spin)
     }
 
-    /// Advance the rotor by `dt`, given its throttle, the battery voltage, and the velocity of
-    /// the air relative to the rotor in the body frame.
+    /// Advance the rotor by `dt`, given its throttle, the battery voltage, the velocity of the
+    /// air relative to the rotor in the body frame, and its density.
     pub fn step(
         &self,
         state: &mut RotorState,
@@ -95,23 +196,52 @@ impl RotorModel {
         // Moving along the thrust axis lowers the angle of attack of the blades
         let inflow = -air.dot(self.axis);
         let advance = match revolutions > 0.5 {
-            true => (inflow / (revolutions * d)).max(0.0),
+            true => inflow / (revolutions * d),
             false => 0.0,
         };
-        let ratio = advance / self.zero_thrust_advance;
-        let ct = self.ct * (1.0 - ratio).max(-0.5);
-        let cp = self.cp * (1.0 - 0.6 * ratio * ratio).max(0.1);
+        let (ct, cp) = self.coefficients.at(advance);
         let thrust = ct * density * revolutions * revolutions * d.powi(4);
+        // Negative where the air drives the propeller, as it windmills
         let drag_torque = cp * density * revolutions * revolutions * d.powi(5) / TAU;
 
-        // The speed controller as an ideal voltage source, which does not brake the motor
-        let current = ((throttle * voltage - state.speed / self.kv) / self.resistance).max(0.0);
-        let motor_torque = (current - self.no_load_current).max(0.0) / self.kv;
+        let (motor_torque, current) = match self.drive {
+            // The speed controller as an ideal voltage source, which does not brake the motor
+            Drive::Electric {
+                kv,
+                resistance,
+                no_load_current,
+            } => {
+                let current = ((throttle * voltage - state.speed / kv) / resistance).max(0.0);
+                ((current - no_load_current).max(0.0) / kv, current)
+            }
+            Drive::Piston {
+                torque,
+                speed,
+                friction,
+            } => {
+                // The brake power at full throttle and rated speed falls with the density of the
+                // air, after Gagg and Ferrar. The friction, which comes off the power the
+                // cylinders make, grows with the speed instead.
+                let charge = (1.132 * density / 1.225 - 0.132).max(0.0);
+                let indicated = throttle * torque * (charge + friction);
+                (indicated - torque * friction * state.speed / speed, 0.0)
+            }
+        };
 
         state.speed = (state.speed + (motor_torque - drag_torque) / self.inertia * dt).max(0.0);
         state.angle = (state.angle + state.speed * self.spin * dt) % (2.0 * PI);
         state.current = current;
         state.thrust = thrust;
+        state.torque = motor_torque;
+
+        // After momentum theory, the rotor speeds up the air through its disc by the velocity
+        // that carries the thrust away as momentum
+        let area = PI * d * d / 4.0;
+        let axial = inflow.max(0.0);
+        let induced = match thrust > 0.0 {
+            true => 0.5 * (-axial + (axial * axial + 2.0 * thrust / (density * area)).sqrt()),
+            false => 0.0,
+        };
 
         let force = self.axis * thrust;
         let reaction = -self.axis * (self.spin * motor_torque);
@@ -119,6 +249,13 @@ impl RotorModel {
             force,
             moment: (self.position - center_of_gravity).cross(force) + reaction,
             current: current * throttle,
+            slipstream: Slipstream {
+                position: self.position,
+                axis: self.axis,
+                radius: d / 2.0,
+                induced,
+                inflow: axial,
+            },
         }
     }
 }

@@ -82,6 +82,16 @@ impl Actuators {
         }
     }
 
+    /// Take over the commands and positions of the actuators of the same name.
+    pub fn carry_over(&mut self, previous: &Actuators) {
+        for (i, config) in self.configs.iter().enumerate() {
+            if let Some(j) = previous.configs.iter().position(|c| c.name == config.name) {
+                self.commands[i] = clamp(config.kind, previous.commands[j]);
+                self.positions[i] = clamp(config.kind, previous.positions[j]);
+            }
+        }
+    }
+
     /// Move all actuators to their commanded positions at once.
     pub fn settle(&mut self) {
         self.positions.copy_from_slice(&self.commands);

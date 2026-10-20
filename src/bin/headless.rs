@@ -6,7 +6,7 @@ use bevy_worldmap::{
     options::{Options, USAGE},
     sim::{
         Simulation, Status,
-        config::{ActuatorKind, AircraftConfig},
+        config::{ActuatorKind, AircraftConfig, Watcher},
         runner::{Request, SimHandle},
     },
 };
@@ -43,20 +43,41 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let path = options.aircraft.ok_or("an aircraft is needed")?;
+    let path = options.aircraft.clone().ok_or("an aircraft is needed")?;
+    let mut watcher = Watcher::new(&path);
     let config = AircraftConfig::load(&path)?;
     println!("Simulating {} in {:?} mode", config.name, options.mode);
     let throttle = config
         .actuators
         .iter()
         .position(|a| a.kind == ActuatorKind::Throttle);
-    let simulation = Simulation::new(config, options.spawn, Box::new(options.wind))?;
+    let simulation = Simulation::new(
+        config.clone(),
+        options.spawn_for(&config),
+        Box::new(options.wind),
+    )?;
     let handle = SimHandle::spawn(simulation, options.mode).map_err(|err| err.to_string())?;
     handle.set_ground(ground);
 
     let mut launched = false;
     loop {
         std::thread::sleep(Duration::from_secs(1));
+        // Carry on with the edited definition whenever it is saved
+        match watcher.poll().map(|config| {
+            let config = config?;
+            Simulation::new(
+                config.clone(),
+                options.spawn_for(&config),
+                Box::new(options.wind),
+            )
+        }) {
+            Some(Ok(simulation)) => {
+                handle.replace_aircraft(simulation);
+                println!("Reloaded the aircraft from {path:?}");
+            }
+            Some(Err(err)) => eprintln!("Unable to reload the aircraft: {err}"),
+            None => {}
+        }
         let snapshot = handle.snapshot();
         if !launched && launch_after.is_some_and(|t| snapshot.time >= t) {
             handle.request(Request::Launch);

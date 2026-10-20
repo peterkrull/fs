@@ -9,10 +9,31 @@
 //! itself. The vortex strengths are solved iteratively, starting from those of the previous
 //! step, which makes a few iterations per step enough.
 //!
+//! The trailing vortices leave along the flow, and are realigned with it when it turns, such as
+//! with the angle of attack or the sideslip. This matters for the tail, which sees less downwash
+//! the further the wake of the wing passes from it. Downstream of a strip, its trailing vortices
+//! have the strength it had when they were shed, so a tail sees the downwash of the wing from
+//! the moment before, which damps pitching.
+//!
+//! Beyond the stall, where the lift of a section falls with its angle of attack, the lifting
+//! line has many solutions, among them a zigzag of strong and weak strips along the span. The
+//! vortex strengths of stalled strips are smoothed along the span to pick the smooth solution.
+//!
+//! Each strip sees the flow in the section across its bound vortex, after simple sweep theory:
+//! the flow along a swept bound vortex does not add to its lift. This lowers the lift slope of
+//! swept surfaces, which the lifting line alone does not, and makes a swept wing roll away from
+//! a sideslip like one with dihedral.
+//!
+//! Surfaces and bodies behind a rotor are in its slipstream, which momentum theory describes:
+//! the air speeds up through the disc, and further behind it to twice that, as the stream
+//! contracts.
+//!
 //! Bodies are divided into cells along their length, each with drag from the flow across and
-//! along it.
+//! along it. After slender body theory, the flow across a body also pushes on it where it
+//! widens, and pulls where it narrows. On a closed body these forces cancel, but turn it across
+//! the flow (the Munk moment), which makes a fuselage destabilizing in pitch and yaw.
 
-use std::f64::consts::PI;
+use std::{collections::VecDeque, f64::consts::PI};
 
 use bevy::math::DVec3;
 
@@ -25,6 +46,23 @@ use super::{
 const ITERATIONS: usize = 3;
 /// Iterations to start from scratch.
 const INITIAL_ITERATIONS: usize = 200;
+/// The wake is realigned with the flow once their directions differ by more than this many
+/// radians.
+const WAKE_TOLERANCE: f64 = 1.0 * PI / 180.0;
+/// Below this airspeed in m/s, the wake keeps its direction.
+const WAKE_MIN_SPEED: f64 = 1.0;
+/// Strips further downstream of another strip than this many of its chords see its trailing
+/// vortices as they were shed, see [`Lagged`].
+const LAG_CHORDS: f64 = 1.0;
+/// The longest the trailing vortices take to reach a strip downstream, in seconds.
+const MAX_LAG: f64 = 0.3;
+/// Points along each strip at which the slipstreams are sampled.
+const SLIPSTREAM_SAMPLES: usize = 5;
+/// How strongly the vortex strengths of stalled strips are smoothed along the span, relative to
+/// how much the lift of their section falls with the angle of attack.
+const STALL_SMOOTHING: f64 = 4.0;
+/// Step in angle of attack in radians to find the lift slope of stalled sections.
+const SLOPE_STEP: f64 = 1e-3;
 
 /// A spanwise strip of a lifting surface. Its vectors are in the model frame.
 #[derive(Debug, Clone)]
@@ -43,9 +81,17 @@ pub struct Strip {
     pub chord_dir: DVec3,
     /// Direction in which positive lift acts, at zero angle of attack.
     pub normal: DVec3,
-    /// Direction of the bound vortex, `normal × chord_dir`.
-    pub span_dir: DVec3,
+    /// Direction of the bound vortex from `a` to `b`, which is swept with the surface.
+    pub bound: DVec3,
+    /// Chord direction and lift normal of the section across the bound vortex, in which the
+    /// flow over a swept surface is evaluated.
+    pub section_chord_dir: DVec3,
+    pub section_normal: DVec3,
+    /// Cosine of the sweep, between the bound vortex and the spanwise direction.
+    pub sweep_cos: f64,
+    /// Streamwise chord.
     pub chord: f64,
+    /// Planform area, the chord times the width of the strip across it.
     pub area: f64,
     pub control: Option<StripControl>,
 }
@@ -69,6 +115,9 @@ pub struct BodyCell {
     pub cd_crossflow: f64,
     /// Share of the axial drag of the body, as drag coefficient times area.
     pub axial_area: f64,
+    /// How much the cross section grows over the cell, in m², times the apparent mass factor of
+    /// the body.
+    pub growth: f64,
 }
 
 /// The aerodynamic forces on one strip, in the body frame.
@@ -103,6 +152,50 @@ pub struct Flow<'a> {
     pub density: f64,
     /// Positions of the actuators.
     pub actuators: &'a [f64],
+    /// Time since the previous step, in seconds.
+    pub dt: f64,
+    pub slipstreams: &'a [Slipstream],
+}
+
+/// The stream of air a rotor drives, after momentum theory. Positions and directions are in
+/// the model frame.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Slipstream {
+    /// Center of the disc.
+    pub position: DVec3,
+    /// Direction of the thrust, opposite to the slipstream.
+    pub axis: DVec3,
+    pub radius: f64,
+    /// How much the rotor speeds up the air through its disc, in m/s.
+    pub induced: f64,
+    /// Speed of the air flowing into the disc along its axis.
+    pub inflow: f64,
+}
+
+impl Slipstream {
+    /// The velocity the slipstream adds to the air at a point.
+    pub fn velocity_at(&self, point: DVec3) -> DVec3 {
+        let offset = point - self.position;
+        let behind = -offset.dot(self.axis);
+        if self.induced <= 0.0 || behind <= 0.0 {
+            return DVec3::ZERO;
+        }
+        // The air keeps speeding up behind the disc, to twice its speed through the disc, and
+        // the stream contracts as it does
+        let speedup = self.induced * (1.0 + behind / behind.hypot(self.radius));
+        let radius = self.radius * ((self.inflow + self.induced) / (self.inflow + speedup)).sqrt();
+        // With a soft edge, so that what is at the edge does not jump in and out of it
+        let distance = (offset + self.axis * behind).length();
+        let inside = 1.0 - ((distance / radius - 0.9) / 0.2).clamp(0.0, 1.0);
+        -self.axis * (speedup * inside * inside * (3.0 - 2.0 * inside))
+    }
+}
+
+impl Flow<'_> {
+    /// The velocity the slipstreams add at a point in the model frame.
+    fn slipstream(&self, point: DVec3) -> DVec3 {
+        self.slipstreams.iter().map(|s| s.velocity_at(point)).sum()
+    }
 }
 
 impl Flow<'_> {
@@ -119,13 +212,37 @@ pub struct Aerodynamics {
     pub airfoils: Vec<AirfoilModel>,
     pub drag_elements: Vec<(DVec3, DVec3)>,
     center_of_gravity: DVec3,
-    /// Velocity induced at the center of strip `i` by a unit vortex on strip `j`, at `i * n + j`.
+    /// Direction the trailing vortices leave in, for which the influences were computed.
+    wake: DVec3,
+    /// Velocity induced at the center of strip `i` by a unit vortex on strip `j`, at `i * n + j`,
+    /// leaving out the trailing vortices in `lagged`.
     influence: Vec<DVec3>,
+    lagged: Vec<Lagged>,
     /// Relaxation of the iteration of each strip, against its influence on itself.
     relaxation: Vec<f64>,
+    /// Upwash induced at each strip by its own unit vortex, against its lift, which is positive.
+    self_influence: Vec<f64>,
+    /// The strips on either side of each strip along the span of its surface, if any.
+    neighbors: Vec<[Option<usize>; 2]>,
     /// Vortex strength of each strip.
     circulation: Vec<f64>,
+    /// Recent vortex strengths of all strips, `n` per step, and the time of each step.
+    history: VecDeque<f64>,
+    history_times: VecDeque<f64>,
+    time: f64,
+    /// Velocity induced at each strip by the lagged trailing vortices in this step.
+    lagged_induced: Vec<DVec3>,
     converged: bool,
+}
+
+/// The trailing vortices of strip `source`, which reach strip `target` `distance` downstream,
+/// so that they were shed that long ago.
+struct Lagged {
+    target: usize,
+    source: usize,
+    distance: f64,
+    /// Velocity induced at the target by unit trailing vortices.
+    velocity: DVec3,
 }
 
 impl Aerodynamics {
@@ -223,8 +340,14 @@ impl Aerodynamics {
             let radius_at = |t: f64| interpolate_profile(&body.profile, t);
             let max_radius = body.profile.iter().map(|(_, r)| *r).fold(0.0, f64::max);
             let length = body.length / body.cells as f64;
+            let apparent_mass = apparent_mass_factor(body.length / (2.0 * max_radius).max(1e-9));
+            let area = |t: f64| PI * radius_at(t).powi(2);
             for cell in 0..body.cells {
                 let t = (cell as f64 + 0.5) / body.cells as f64;
+                let (front, back) = (
+                    cell as f64 / body.cells as f64,
+                    (cell + 1) as f64 / body.cells as f64,
+                );
                 cells.push(BodyCell {
                     body: index,
                     center: nose - DVec3::X * (body.length * t),
@@ -232,6 +355,7 @@ impl Aerodynamics {
                     radius: radius_at(t),
                     cd_crossflow: body.cd_crossflow,
                     axial_area: body.cd_axial * PI * max_radius * max_radius / body.cells as f64,
+                    growth: apparent_mass * (area(back) - area(front)),
                 });
             }
         }
@@ -243,51 +367,158 @@ impl Aerodynamics {
             .collect();
 
         let n = strips.len();
-        let mut influence = vec![DVec3::ZERO; n * n];
-        for (i, target) in strips.iter().enumerate() {
-            for (j, source) in strips.iter().enumerate() {
-                influence[i * n + j] = horseshoe(target.center, source, i == j);
-            }
-        }
-        // Damp each strip against its own influence on itself, which would otherwise make the
-        // iteration overshoot for strips that are narrow compared to their chord
-        let relaxation = strips
+        let neighbors = strips
             .iter()
             .enumerate()
-            .map(|(i, s)| {
-                let gain = 0.5
-                    * s.chord
-                    * airfoils[s.airfoil].lift_slope()
-                    * (-influence[i * n + i].dot(s.normal)).max(0.0);
-                1.0 / (1.0 + gain)
+            .map(|(i, strip)| {
+                let at = |point: DVec3, end: fn(&Strip) -> DVec3| {
+                    strips.iter().enumerate().position(|(j, other)| {
+                        j != i
+                            && other.surface == strip.surface
+                            && (end(other) - point).length() < 1e-6
+                    })
+                };
+                [at(strip.a, |s| s.b), at(strip.b, |s| s.a)]
             })
             .collect();
-
-        Ok(Self {
+        let mut aerodynamics = Self {
             strips,
             cells,
             airfoils,
             drag_elements,
             center_of_gravity,
-            influence,
-            relaxation,
+            wake: -DVec3::X,
+            influence: Vec::new(),
+            lagged: Vec::new(),
+            relaxation: Vec::new(),
+            self_influence: Vec::new(),
+            neighbors,
             circulation: vec![0.0; n],
+            history: VecDeque::new(),
+            history_times: VecDeque::new(),
+            time: 0.0,
+            lagged_induced: vec![DVec3::ZERO; n],
             converged: false,
-        })
+        };
+        aerodynamics.align_wake(-DVec3::X);
+        Ok(aerodynamics)
+    }
+
+    /// Compute the influences of the strips on each other, with the trailing vortices leaving
+    /// in the direction `downstream`.
+    fn align_wake(&mut self, downstream: DVec3) {
+        let strips = &self.strips;
+        let n = strips.len();
+        self.wake = downstream;
+        self.influence.clear();
+        self.influence.resize(n * n, DVec3::ZERO);
+        self.lagged.clear();
+        for (i, target) in strips.iter().enumerate() {
+            for (j, source) in strips.iter().enumerate() {
+                let (bound, trailing) = horseshoe(target.center, source, i == j, downstream);
+                let distance = (target.center - source.center).dot(downstream);
+                self.influence[i * n + j] = bound;
+                match distance > LAG_CHORDS * source.chord {
+                    true => self.lagged.push(Lagged {
+                        target: i,
+                        source: j,
+                        distance,
+                        velocity: trailing,
+                    }),
+                    false => self.influence[i * n + j] += trailing,
+                }
+            }
+        }
+        self.self_influence = strips
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (-self.influence[i * n + i].dot(s.section_normal)).max(0.0))
+            .collect();
+        // Damp each strip against its own influence on itself, which would otherwise make the
+        // iteration overshoot for strips that are narrow compared to their chord
+        self.relaxation = strips
+            .iter()
+            .zip(&self.self_influence)
+            .map(|(s, influence)| {
+                let gain =
+                    0.5 * s.chord * s.sweep_cos * self.airfoils[s.airfoil].lift_slope() * influence;
+                1.0 / (1.0 + gain)
+            })
+            .collect();
     }
 
     /// Forget the vortex strengths, for example after the aircraft was teleported.
     pub fn reset(&mut self) {
         self.circulation.fill(0.0);
+        self.history.clear();
+        self.history_times.clear();
         self.converged = false;
+    }
+
+    /// The velocity induced by the lagged trailing vortices, with the strengths they were shed
+    /// with, or with the current strengths when there is no history yet.
+    fn update_lagged(&mut self, airspeed: f64) {
+        let mut induced = std::mem::take(&mut self.lagged_induced);
+        induced.fill(DVec3::ZERO);
+        for lagged in &self.lagged {
+            let delay = (lagged.distance / airspeed.max(1e-3)).min(MAX_LAG);
+            let circulation = self.past_circulation(lagged.source, self.time - delay);
+            induced[lagged.target] += lagged.velocity * circulation;
+        }
+        self.lagged_induced = induced;
+    }
+
+    /// Vortex strength of a strip at a time, interpolated in the history.
+    fn past_circulation(&self, strip: usize, time: f64) -> f64 {
+        let n = self.strips.len();
+        let times = &self.history_times;
+        let at = |k: usize| self.history[k * n + strip];
+        match times.partition_point(|t| *t <= time) {
+            _ if times.is_empty() => self.circulation[strip],
+            0 => at(0),
+            k if k == times.len() => at(k - 1),
+            k => {
+                let t = (time - times[k - 1]) / (times[k] - times[k - 1]).max(1e-12);
+                at(k - 1) + (at(k) - at(k - 1)) * t
+            }
+        }
     }
 
     pub fn loads(&mut self, flow: &Flow) -> AeroLoads {
         let n = self.strips.len();
+        self.time += flow.dt;
+        let airspeed = flow.velocity.length();
+        if airspeed > WAKE_MIN_SPEED {
+            let downstream = flow.velocity / airspeed;
+            if downstream.angle_between(self.wake) > WAKE_TOLERANCE {
+                self.align_wake(downstream);
+            }
+        }
+        // Without a history, the trailing vortices downstream are as strong as they are now
+        let history = !self.history_times.is_empty();
+        if history {
+            self.update_lagged(airspeed);
+        }
+
+        // Along each strip, which may be partly in a slipstream
         let freestream: Vec<DVec3> = self
             .strips
             .iter()
-            .map(|s| flow.at(s.center - self.center_of_gravity))
+            .map(|s| {
+                let slipstream = match flow.slipstreams.is_empty() {
+                    true => DVec3::ZERO,
+                    false => {
+                        (0..SLIPSTREAM_SAMPLES)
+                            .map(|k| {
+                                let t = (k as f64 + 0.5) / SLIPSTREAM_SAMPLES as f64;
+                                flow.slipstream(s.a + (s.b - s.a) * t)
+                            })
+                            .sum::<DVec3>()
+                            / SLIPSTREAM_SAMPLES as f64
+                    }
+                };
+                flow.at(s.center - self.center_of_gravity) + slipstream
+            })
             .collect();
         let deflections: Vec<f64> = self
             .strips
@@ -305,21 +536,47 @@ impl Aerodynamics {
             INITIAL_ITERATIONS
         };
         let mut targets = vec![0.0; n];
+        let mut rates = vec![0.0; n];
         for _ in 0..iterations {
+            if !history {
+                self.update_lagged(airspeed);
+            }
             for i in 0..n {
                 let section = self.section(i, freestream[i], deflections[i]);
-                targets[i] = 0.5 * section.speed * self.strips[i].chord * section.cl;
+                let strip = &self.strips[i];
+                let chord = strip.chord * strip.sweep_cos;
+                // Beyond the stall, where the lift falls with the angle of attack, the lifting
+                // line has many solutions, such as a zigzag along the span. Smoothing the vortex
+                // strengths there, as much as the lift falls, picks the smooth one.
+                let smoothing = STALL_SMOOTHING
+                    * 0.5
+                    * chord
+                    * (-section.slope).max(0.0)
+                    * self.self_influence[i];
+                let circulation = self.circulation[i];
+                let [previous, next] =
+                    self.neighbors[i].map(|j| j.map_or(circulation, |j| self.circulation[j]));
+                targets[i] = 0.5 * section.speed * chord * section.cl
+                    + smoothing * (previous + next - 2.0 * circulation);
+                rates[i] = 1.0 / (1.0 / self.relaxation[i] + 2.0 * smoothing);
             }
-            for ((circulation, relaxation), target) in self
-                .circulation
-                .iter_mut()
-                .zip(&self.relaxation)
-                .zip(&targets)
+            for ((circulation, rate), target) in
+                self.circulation.iter_mut().zip(&rates).zip(&targets)
             {
-                *circulation += relaxation * (target - *circulation);
+                *circulation += rate * (target - *circulation);
             }
         }
         self.converged = true;
+        self.history_times.push_back(self.time);
+        self.history.extend(&self.circulation);
+        while self
+            .history_times
+            .front()
+            .is_some_and(|t| *t < self.time - MAX_LAG - 0.01)
+        {
+            self.history_times.pop_front();
+            self.history.drain(..n);
+        }
 
         let mut loads = AeroLoads {
             strips: Vec::with_capacity(n),
@@ -331,18 +588,21 @@ impl Aerodynamics {
         for i in 0..n {
             let strip = &self.strips[i];
             let section = self.section(i, freestream[i], deflections[i]);
-            let q = 0.5 * flow.density * section.speed * section.speed * strip.area;
-            let (lift, drag, moment) = match section.speed > 1e-6 {
-                true => {
-                    let flow_dir = section.in_plane / section.speed;
-                    (
-                        flow_dir.cross(strip.span_dir) * (q * section.cl),
-                        flow_dir * (q * section.cd),
-                        strip.span_dir * (q * strip.chord * section.cm),
-                    )
-                }
-                false => (DVec3::ZERO, DVec3::ZERO, DVec3::ZERO),
+            // The section across the bound vortex has a chord shorter by the cosine of the sweep,
+            // and is as long as the bound vortex, which together make up the planform area
+            let half_rho = 0.5 * flow.density * strip.area;
+            let q = half_rho * section.speed * section.speed;
+            let (lift, moment) = match section.speed > 1e-6 {
+                true => (
+                    (section.across / section.speed).cross(strip.bound) * (q * section.cl),
+                    strip.bound * (q * strip.chord * strip.sweep_cos * section.cm),
+                ),
+                false => (DVec3::ZERO, DVec3::ZERO),
             };
+            // Skin friction acts along the whole flow, while the drag that comes with lift and
+            // separation acts across the bound vortex
+            let drag = section.air * (half_rho * section.air.length() * section.cd_zero)
+                + section.across * (half_rho * section.speed * (section.cd - section.cd_zero));
             let offset = strip.center - self.center_of_gravity;
             let force = lift + drag;
             let torque = offset.cross(force) + moment;
@@ -373,7 +633,25 @@ impl Aerodynamics {
 
         for cell in &self.cells {
             let offset = cell.center - self.center_of_gravity;
-            let air = flow.at(offset);
+            // Over the cross section of the cell, of which the slipstream may cover part
+            let slipstream = match flow.slipstreams.is_empty() {
+                true => DVec3::ZERO,
+                false => {
+                    let r = cell.radius * std::f64::consts::FRAC_1_SQRT_2;
+                    [
+                        DVec3::ZERO,
+                        DVec3::Y * r,
+                        -DVec3::Y * r,
+                        DVec3::Z * r,
+                        -DVec3::Z * r,
+                    ]
+                    .iter()
+                    .map(|offset| flow.slipstream(cell.center + *offset))
+                    .sum::<DVec3>()
+                        / 5.0
+                }
+            };
+            let air = flow.at(offset) + slipstream;
             let axial = air.x;
             let across = DVec3::new(0.0, air.y, air.z);
             let crossflow = across
@@ -385,7 +663,9 @@ impl Aerodynamics {
                     * cell.length
                     * cell.cd_crossflow);
             let along = DVec3::X * (0.5 * flow.density * axial * axial.abs() * cell.axial_area);
-            let force = crossflow + along;
+            // The flow across a widening cell pushes it along with the flow, as it flows along
+            let potential = across * (flow.density * cell.growth * -axial);
+            let force = crossflow + along + potential;
             loads.force += force;
             loads.moment += offset.cross(force);
             loads.cells.push(force);
@@ -393,7 +673,7 @@ impl Aerodynamics {
 
         for (position, cd_area) in &self.drag_elements {
             let offset = *position - self.center_of_gravity;
-            let air = flow.at(offset);
+            let air = flow.at(offset) + flow.slipstream(*position);
             let force = 0.5 * flow.density * air * air.abs() * *cd_area;
             loads.force += force;
             loads.moment += offset.cross(force);
@@ -411,25 +691,43 @@ impl Aerodynamics {
             .iter()
             .zip(&self.circulation)
             .map(|(v, g)| *v * *g)
-            .sum();
+            .sum::<DVec3>()
+            + self.lagged_induced[i];
         let air = freestream + induced;
-        let along = air.dot(strip.chord_dir);
-        let up = air.dot(strip.normal);
-        let in_plane = strip.chord_dir * along + strip.normal * up;
-        let speed = in_plane.length();
+        // Flow along the bound vortex does not change the lift of the section (simple sweep
+        // theory), which makes the lift of swept surfaces depend on the sideslip
+        let across = air - strip.bound * air.dot(strip.bound);
+        let along = across.dot(strip.section_chord_dir);
+        let up = across.dot(strip.section_normal);
+        let speed = across.length();
         let alpha = up.atan2(along);
 
+        // The flap turns about its hinge, which follows the sweep, so its deflection is the same
+        // in the section across it
         let (flap_alpha, flap_cm, flap_cd) = strip
             .control
             .as_ref()
             .map_or((0.0, 0.0, 0.0), |c| c.flap.effect(deflection));
-        let c = self.airfoils[strip.airfoil].coefficients(alpha + flap_alpha);
+        let airfoil = &self.airfoils[strip.airfoil];
+        let c = airfoil.swept_coefficients(alpha, strip.sweep_cos, flap_alpha);
+        // Only needed where the flow separates, as the lift may fall there
+        let slope = match c.separation > 1e-3 {
+            true => {
+                let ahead =
+                    airfoil.swept_coefficients(alpha + SLOPE_STEP, strip.sweep_cos, flap_alpha);
+                (ahead.cl - c.cl) / SLOPE_STEP
+            }
+            false => 0.0,
+        };
         Section {
-            in_plane,
+            slope,
+            air,
+            across,
             speed,
             alpha,
             cl: c.cl,
             cd: c.cd + flap_cd,
+            cd_zero: airfoil.cd_zero(),
             cm: c.cm + flap_cm * (1.0 - c.separation),
             separation: c.separation,
         }
@@ -437,11 +735,18 @@ impl Aerodynamics {
 }
 
 struct Section {
-    in_plane: DVec3,
+    /// Local velocity of the air, including the velocity induced by the vortices.
+    air: DVec3,
+    /// The part of it across the bound vortex, and its magnitude.
+    across: DVec3,
     speed: f64,
+    /// Angle of attack in the section across the bound vortex.
     alpha: f64,
     cl: f64,
+    /// Lift slope of the section per radian, where the flow separates.
+    slope: f64,
     cd: f64,
+    cd_zero: f64,
     cm: f64,
     separation: f64,
 }
@@ -483,63 +788,83 @@ fn strip(surface: usize, airfoil: usize, inner: Station, outer: Station, mid: St
         trailing.swap(0, 1);
     }
     let chord = (inner.chord + outer.chord) / 2.0;
-    Strip {
-        surface,
-        airfoil,
-        center: (a + b) / 2.0,
-        a,
-        b,
-        leading,
-        trailing,
-        chord_dir,
-        normal,
-        span_dir,
-        chord,
-        area: chord * (b - a).length(),
-        control: None,
-    }
+    Strip::new(
+        surface, airfoil, a, b, leading, trailing, chord_dir, normal, chord,
+    )
 }
 
 impl Strip {
+    fn new(
+        surface: usize,
+        airfoil: usize,
+        a: DVec3,
+        b: DVec3,
+        leading: [DVec3; 2],
+        trailing: [DVec3; 2],
+        chord_dir: DVec3,
+        normal: DVec3,
+        chord: f64,
+    ) -> Strip {
+        let bound = (b - a).normalize();
+        let sweep_cos = chord_dir.cross(bound).length();
+        let section_chord_dir = (chord_dir - bound * chord_dir.dot(bound)).normalize();
+        Strip {
+            surface,
+            airfoil,
+            center: (a + b) / 2.0,
+            a,
+            b,
+            leading,
+            trailing,
+            chord_dir,
+            normal,
+            bound,
+            section_chord_dir,
+            section_normal: section_chord_dir.cross(bound),
+            sweep_cos,
+            chord,
+            area: chord * chord_dir.cross(b - a).length(),
+            control: None,
+        }
+    }
+
     /// The same strip on the other side of the `x`-`z` plane.
     fn mirrored(&self) -> Strip {
         let m = |v: DVec3| DVec3::new(v.x, -v.y, v.z);
-        let chord_dir = m(self.chord_dir);
-        let normal = m(self.normal);
-        let span_dir = normal.cross(chord_dir);
         // Mirroring reverses the direction from `a` to `b`, so swap them back
-        Strip {
-            surface: self.surface,
-            airfoil: self.airfoil,
-            center: m(self.center),
-            a: m(self.b),
-            b: m(self.a),
-            leading: [m(self.leading[1]), m(self.leading[0])],
-            trailing: [m(self.trailing[1]), m(self.trailing[0])],
-            chord_dir,
-            normal,
-            span_dir,
-            chord: self.chord,
-            area: self.area,
-            control: None,
-        }
+        Strip::new(
+            self.surface,
+            self.airfoil,
+            m(self.b),
+            m(self.a),
+            [m(self.leading[1]), m(self.leading[0])],
+            [m(self.trailing[1]), m(self.trailing[0])],
+            m(self.chord_dir),
+            m(self.normal),
+            self.chord,
+        )
     }
 }
 
 /// Velocity induced at `point` by a horseshoe vortex of unit strength on `strip`: a bound vortex
-/// from `a` to `b`, with trailing vortices along the `-x` axis. The bound vortex does not induce
-/// a velocity on its own midpoint.
-fn horseshoe(point: DVec3, strip: &Strip, own: bool) -> DVec3 {
+/// from `a` to `b`, and trailing vortices, given separately. The trailing vortices run along the
+/// chord to the trailing edge, and leave from there in the direction `downstream`. The bound
+/// vortex does not induce a velocity on its own midpoint.
+fn horseshoe(point: DVec3, strip: &Strip, own: bool, downstream: DVec3) -> (DVec3, DVec3) {
     // Regularizes the velocity close to vortex lines, such as where the wake of the wing
     // passes the tail
     let core = 0.1 * (strip.b - strip.a).length();
-    let downstream = -DVec3::X;
-    let mut velocity =
-        trailing(point, strip.b, downstream, core) - trailing(point, strip.a, downstream, core);
-    if !own {
-        velocity += segment(point, strip.a, strip.b, core);
-    }
-    velocity
+    // Leaving along the flow right from the bound vortex would skew the trailing vortices next
+    // to the neighbouring strips in a sideslip, and make even a straight wing roll strongly
+    let leg = |start: DVec3, edge: DVec3| {
+        segment(point, start, edge, core) + trailing(point, edge, downstream, core)
+    };
+    let trailing = leg(strip.b, strip.trailing[1]) - leg(strip.a, strip.trailing[0]);
+    let bound = match own {
+        true => DVec3::ZERO,
+        false => segment(point, strip.a, strip.b, core),
+    };
+    (bound, trailing)
 }
 
 /// Velocity induced by a unit vortex segment from `p1` to `p2` (Biot-Savart).
@@ -567,6 +892,19 @@ fn trailing(point: DVec3, start: DVec3, dir: DVec3, core: f64) -> DVec3 {
     dir.cross(r) * ((1.0 + dir.dot(r / length)) / (4.0 * PI * denominator))
 }
 
+/// Lamb's apparent mass factor `k2 - k1` of a prolate spheroid, by its length over its diameter,
+/// which scales the forces of slender body theory to those of bodies of finite length.
+fn apparent_mass_factor(fineness: f64) -> f64 {
+    if fineness <= 1.0 + 1e-6 {
+        return 0.0;
+    }
+    let e = (1.0 - 1.0 / (fineness * fineness)).sqrt();
+    let log = ((1.0 + e) / (1.0 - e)).ln();
+    let alpha = 2.0 * (1.0 - e * e) / e.powi(3) * (0.5 * log - e);
+    let beta = 1.0 / (e * e) - (1.0 - e * e) / (2.0 * e.powi(3)) * log;
+    beta / (2.0 - beta) - alpha / (2.0 - alpha)
+}
+
 fn interpolate_profile(profile: &[(f64, f64)], t: f64) -> f64 {
     match profile.iter().position(|(s, _)| *s >= t) {
         None => profile.last().map_or(0.0, |(_, r)| *r),
@@ -585,6 +923,11 @@ mod tests {
 
     /// A rectangular wing of aspect ratio 8 with a thin, symmetric airfoil.
     fn wing(cells: usize) -> Aerodynamics {
+        swept_wing(cells, 4.0, 0.0)
+    }
+
+    /// A wing of constant chord 1 with a thin, symmetric airfoil, of span `2 * half_span`.
+    fn swept_wing(cells: usize, half_span: f64, sweep: f64) -> Aerodynamics {
         let config = AircraftConfig::parse(&format!(
             r#"(
                 name: "wing", mass: 1.0, center_of_gravity: (0.0, 0.0, 0.0),
@@ -592,7 +935,8 @@ mod tests {
                 airfoils: {{ "thin": Parametric(lift_slope: 6.283185, cd_min: 0.0, cd_k: 0.0,
                     stall_positive: 30.0, stall_negative: -30.0) }},
                 surfaces: [(name: "wing", airfoil: "thin", root: (0.25, 0.0, 0.0), root_chord: 1.0,
-                    mirror: true, sections: [(span: 4.0, tip_chord: 1.0, cells: {cells})])],
+                    mirror: true, sections: [(span: {half_span}, tip_chord: 1.0, sweep: {sweep},
+                    cells: {cells})])],
                 actuators: [],
             )"#
         ))
@@ -600,17 +944,26 @@ mod tests {
         Aerodynamics::new(&config, &[]).unwrap()
     }
 
-    fn coefficients(aero: &mut Aerodynamics, alpha: f64) -> (f64, f64) {
-        // Flying forward, with the air coming from ahead and below
-        let speed = 20.0;
-        let flow = Flow {
-            velocity: DVec3::new(-alpha.cos(), 0.0, -alpha.sin()) * speed,
+    /// Flying forward and sideslipping to the right, with the air coming from ahead, below and
+    /// the right.
+    fn flow(alpha: f64, beta: f64) -> Flow<'static> {
+        let (sa, ca) = alpha.sin_cos();
+        let (sb, cb) = beta.sin_cos();
+        Flow {
+            velocity: -DVec3::new(ca * cb, sb, sa * cb) * 20.0,
             rates: DVec3::ZERO,
             density: 1.225,
             actuators: &[],
-        };
-        let loads = aero.loads(&flow);
-        let q = 0.5 * 1.225 * speed * speed * 8.0;
+            dt: 0.001,
+            slipstreams: &[],
+        }
+    }
+
+    fn coefficients(aero: &mut Aerodynamics, alpha: f64) -> (f64, f64) {
+        let speed = 20.0;
+        let loads = aero.loads(&flow(alpha, 0.0));
+        let area: f64 = aero.strips.iter().map(|s| s.area).sum();
+        let q = 0.5 * 1.225 * speed * speed * area;
         let lift_dir = DVec3::new(alpha.sin(), 0.0, -alpha.cos());
         let drag_dir = -DVec3::new(alpha.cos(), 0.0, alpha.sin());
         (loads.force.dot(lift_dir) / q, loads.force.dot(drag_dir) / q)
@@ -642,6 +995,8 @@ mod tests {
             rates: DVec3::ZERO,
             density: 1.225,
             actuators: &[],
+            dt: 0.001,
+            slipstreams: &[],
         };
         let loads = aero.loads(&flow);
         // Strips alternate between the right and left side, from the root outwards
@@ -669,6 +1024,244 @@ mod tests {
         assert!((coarse - fine).abs() < 0.02 * fine, "{coarse} vs {fine}");
     }
 
+    /// Sweep lowers the lift slope, which the formula of Helmbold and DATCOM gives within a few
+    /// percent of panel methods.
+    #[test]
+    fn sweep_lowers_the_lift_slope() {
+        let alpha = 4f64.to_radians();
+        for sweep in [30.0, 45.0] {
+            let (cl, _) = coefficients(&mut swept_wing(20, 3.0, sweep), alpha);
+            let slope = cl / alpha;
+            let (aspect, tan) = (6.0, f64::to_radians(sweep).tan());
+            let expected =
+                2.0 * PI * aspect / (2.0 + (aspect * aspect * (1.0 + tan * tan) + 4.0).sqrt());
+            assert!(
+                (slope / expected - 1.0).abs() < 0.12,
+                "sweep {sweep}: lift slope {slope} vs {expected}"
+            );
+        }
+    }
+
+    /// The wing sweeping into a sideslip flies across a lower sweep, and the other one across a
+    /// higher sweep, so a swept wing rolls away from the sideslip like one with dihedral.
+    #[test]
+    fn sweep_acts_as_dihedral() {
+        let roll = |sweep: f64| {
+            let mut aero = swept_wing(16, 3.0, sweep);
+            aero.loads(&flow(5f64.to_radians(), 5f64.to_radians()))
+                .moment
+                .x
+        };
+        let (straight, swept) = (roll(0.0), roll(30.0));
+        println!("rolling moment in sideslip: straight {straight:.1}, swept {swept:.1}");
+        // The skewed wake of the straight wing rolls it a little the other way
+        assert!(
+            swept - straight < -5.0 * straight.abs(),
+            "{straight} vs {swept}"
+        );
+    }
+
+    /// The wing of [`wing`], with a tail four chords behind it, in its plane.
+    fn wing_and_tail() -> Aerodynamics {
+        let config = AircraftConfig::parse(
+            r#"(
+                name: "wing and tail", mass: 1.0, center_of_gravity: (0.0, 0.0, 0.0),
+                inertia: (ixx: 1.0, iyy: 1.0, izz: 1.0),
+                airfoils: { "thin": Parametric(lift_slope: 6.283185, cd_min: 0.0, cd_k: 0.0,
+                    stall_positive: 30.0, stall_negative: -30.0) },
+                surfaces: [
+                    (name: "wing", airfoil: "thin", root: (0.25, 0.0, 0.0), root_chord: 1.0,
+                        mirror: true, sections: [(span: 4.0, tip_chord: 1.0, cells: 12)]),
+                    (name: "tail", airfoil: "thin", root: (-3.75, 0.0, 0.0), root_chord: 0.5,
+                        mirror: true, sections: [(span: 1.0, tip_chord: 0.5, cells: 4)]),
+                ],
+                actuators: [],
+            )"#,
+        )
+        .unwrap();
+        Aerodynamics::new(&config, &[]).unwrap()
+    }
+
+    /// The downwash at the tail, in radians, and the pitching moment, in steady flow.
+    fn downwash(aero: &mut Aerodynamics, alpha: f64) -> f64 {
+        aero.reset();
+        let loads = aero.loads(&flow(alpha, 0.0));
+        let tail: Vec<f64> = aero
+            .strips
+            .iter()
+            .zip(&loads.strips)
+            .filter(|(strip, _)| strip.surface == 1)
+            .map(|(_, load)| load.alpha)
+            .collect();
+        alpha - tail.iter().sum::<f64>() / tail.len() as f64
+    }
+
+    /// The wake leaves along the flow, so at a higher angle of attack it passes further above
+    /// the tail, which sees less downwash for the lift of the wing.
+    #[test]
+    fn wake_rises_above_the_tail() {
+        let mut aero = wing_and_tail();
+        let (low, high) = (4f64.to_radians(), 12f64.to_radians());
+        let gradient_low = downwash(&mut aero, low) / low;
+        let gradient_high = downwash(&mut aero, high) / high;
+        let wake = -DVec3::new(high.cos(), 0.0, high.sin());
+        assert!(aero.wake.angle_between(wake) < WAKE_TOLERANCE);
+        // Only a little, as the wake rises by less than a tenth of the span
+        assert!(
+            gradient_high < 0.99 * gradient_low,
+            "downwash per angle of attack {gradient_low} at 4 deg, {gradient_high} at 12 deg"
+        );
+    }
+
+    /// The tail sees the downwash the wing shed a moment ago, so right after the angle of
+    /// attack increases, the tail lifts more than it will once the wake has caught up.
+    #[test]
+    fn tail_sees_the_downwash_of_the_past() {
+        let mut aero = wing_and_tail();
+        let (before, after) = (flow(2f64.to_radians(), 0.0), flow(6f64.to_radians(), 0.0));
+        for _ in 0..500 {
+            aero.loads(&before);
+        }
+        let first = aero.loads(&after).moment.y;
+        // The wake takes 4 m at 20 m/s to reach the tail
+        for _ in 0..100 {
+            aero.loads(&after);
+        }
+        let steady = aero.loads(&after).moment.y;
+        assert!(
+            first < steady - 0.05 * steady.abs(),
+            "pitching moment {first} at first, {steady} once steady"
+        );
+    }
+
+    /// A spheroid of fineness 10 at an angle of attack turns nose up with the moment Munk found,
+    /// `½ ρ V² vol (k2 - k1) sin 2α`.
+    #[test]
+    fn munk_moment() {
+        assert!((apparent_mass_factor(10.0) - 0.9395).abs() < 0.001);
+        let profile: Vec<String> = (0..=40)
+            .map(|i| {
+                let t = i as f64 / 40.0;
+                format!("({t}, {})", 0.1 * (1.0 - (2.0 * t - 1.0).powi(2)).sqrt())
+            })
+            .collect();
+        let config = AircraftConfig::parse(&format!(
+            r#"(name: "spheroid", mass: 1.0, center_of_gravity: (-1.0, 0.0, 0.0),
+                inertia: (ixx: 1.0, iyy: 1.0, izz: 1.0), actuators: [],
+                bodies: [(name: "spheroid", nose: (0.0, 0.0, 0.0), length: 2.0,
+                    profile: [{}], cells: 40)])"#,
+            profile.join(", ")
+        ))
+        .unwrap();
+        let mut aero = Aerodynamics::new(&config, &[]).unwrap();
+        let alpha = 5f64.to_radians();
+        let moment = aero.loads(&flow(alpha, 0.0)).moment.y;
+        let volume = 4.0 / 3.0 * PI * 0.1 * 0.1;
+        let expected = 0.5 * 1.225 * 400.0 * volume * 0.9395 * (2.0 * alpha).sin();
+        assert!(
+            (moment / expected - 1.0).abs() < 0.05,
+            "{moment} vs {expected}"
+        );
+    }
+
+    /// The slipstream of a static rotor speeds up to twice its speed through the disc, and
+    /// contracts to `1 / √2` of the disc.
+    #[test]
+    fn slipstream_after_momentum_theory() {
+        let slipstream = Slipstream {
+            position: DVec3::ZERO,
+            axis: DVec3::X,
+            radius: 0.5,
+            induced: 5.0,
+            inflow: 0.0,
+        };
+        let far = |offset: f64| slipstream.velocity_at(DVec3::new(-100.0, offset, 0.0));
+        assert!((far(0.0) + DVec3::X * 10.0).length() < 0.01, "{}", far(0.0));
+        assert!(far(0.32).length() > 9.9 && far(0.4).length() < 1e-9);
+        let near = slipstream.velocity_at(DVec3::new(-1e-6, 0.0, 0.0));
+        assert!((near.x + 5.0).abs() < 0.01, "{near}");
+        // Nothing ahead of the disc
+        assert_eq!(
+            slipstream.velocity_at(DVec3::new(0.1, 0.0, 0.0)),
+            DVec3::ZERO
+        );
+    }
+
+    /// With the aircraft standing still, the part of a wing in the slipstream of a rotor
+    /// ahead of it lifts, and the rest does not.
+    #[test]
+    fn surfaces_lift_in_the_slipstream() {
+        let config = AircraftConfig::parse(
+            r#"(name: "wing", mass: 1.0, center_of_gravity: (0.0, 0.0, 0.0),
+                inertia: (ixx: 1.0, iyy: 1.0, izz: 1.0), actuators: [],
+                airfoils: { "thin": Parametric(lift_slope: 6.283185, cd_min: 0.01,
+                    stall_positive: 15.0, stall_negative: -15.0) },
+                surfaces: [(name: "wing", airfoil: "thin", root: (0.25, 0.0, 0.0),
+                    root_chord: 1.0, incidence: 5.0, mirror: true,
+                    sections: [(span: 4.0, tip_chord: 1.0, cells: 16)])])"#,
+        )
+        .unwrap();
+        let mut aero = Aerodynamics::new(&config, &[]).unwrap();
+        let slipstreams = [Slipstream {
+            position: DVec3::new(1.0, 0.0, 0.0),
+            axis: DVec3::X,
+            radius: 0.6,
+            induced: 5.0,
+            inflow: 0.0,
+        }];
+        let flow = Flow {
+            velocity: DVec3::ZERO,
+            slipstreams: &slipstreams,
+            ..flow(0.0, 0.0)
+        };
+        let loads = aero.loads(&flow);
+        assert!(loads.force.z < -3.0, "lift {}", -loads.force.z);
+        // Outside, only the vortices of the part inside move the air
+        let (mut inside, mut outside) = (0.0f64, 0.0f64);
+        for (strip, load) in aero.strips.iter().zip(&loads.strips) {
+            match strip.a.y.abs().min(strip.b.y.abs()) > 0.6 {
+                true => outside = outside.max(load.lift.length()),
+                false => inside = inside.max(load.lift.length()),
+            }
+        }
+        assert!(outside < 0.1 * inside, "{outside} outside, {inside} inside");
+    }
+
+    /// Beyond the stall, the vortex strengths are smooth along the span, rather than zigzag,
+    /// and a rectangular wing stalls from the root outwards.
+    #[test]
+    fn stall_is_smooth() {
+        let config = AircraftConfig::parse(
+            r#"(name: "wing", mass: 1.0, center_of_gravity: (0.0, 0.0, 0.0),
+                inertia: (ixx: 1.0, iyy: 1.0, izz: 1.0), actuators: [],
+                airfoils: { "cambered": Parametric(lift_slope: 5.8, zero_lift_angle: -3.0,
+                    cd_min: 0.01, stall_positive: 12.0, stall_negative: -10.0) },
+                surfaces: [(name: "wing", airfoil: "cambered", root: (0.25, 0.0, 0.0),
+                    root_chord: 1.0, mirror: true,
+                    sections: [(span: 4.0, tip_chord: 1.0, cells: 16)])])"#,
+        )
+        .unwrap();
+        for alpha in [13.0, 15.0] {
+            let mut aero = Aerodynamics::new(&config, &[]).unwrap();
+            let flow = flow(f64::to_radians(alpha), 0.0);
+            for _ in 0..1000 {
+                aero.loads(&flow);
+            }
+            let g = &aero.circulation;
+            let peak = g.iter().fold(0.0f64, |m, g| m.max(g.abs()));
+            let roughness = (0..g.len())
+                .filter_map(|i| {
+                    let [previous, next] = aero.neighbors[i];
+                    Some((g[i] - (g[previous?] + g[next?]) / 2.0).abs() / peak)
+                })
+                .fold(0.0, f64::max);
+            // Attached flow has about 0.04, from the curvature towards the tips
+            assert!(roughness < 0.08, "{alpha} deg: roughness {roughness}");
+            // The root has stalled, while further out the wing still lifts more
+            assert!(g[0] < 0.95 * peak, "{alpha} deg: {g:?}");
+        }
+    }
+
     #[test]
     fn rolling_is_damped() {
         let mut aero = wing(12);
@@ -677,6 +1270,8 @@ mod tests {
             rates: DVec3::new(1.0, 0.0, 0.0),
             density: 1.225,
             actuators: &[],
+            dt: 0.001,
+            slipstreams: &[],
         };
         let loads = aero.loads(&flow);
         assert!(loads.moment.x < 0.0, "roll moment {}", loads.moment.x);

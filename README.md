@@ -14,7 +14,7 @@ cargo run --release -- --no-aircraft
 |---|---|
 | `--aircraft PATH` | aircraft definition, default `assets/aircraft/uav.ron` |
 | `--spawn LAT,LON,ALT,HDG` | where the aircraft starts: degrees, meters above sea level, degrees |
-| `--launch-speed M/S` | airspeed when launched, default 14 |
+| `--launch-speed M/S` | airspeed when launched, default that of the aircraft, or 14 |
 | `--wind FROM,SPEED` | constant wind from a heading in degrees, in m/s |
 | `--sitl [PORT]` | lockstep with ArduPilot SITL, default port 9002 |
 | `--radio ORDER` | use game controllers as RC radios with this channel order, see below |
@@ -61,18 +61,31 @@ independent of rendering (`src/sim`).
   moment of its airfoil at its local angle of attack, which includes the rotation of the aircraft
   and the wind. Beyond the stall, the coefficients blend into those of a flat plate, so any
   attitude is handled, including flying backwards.
+- **Sweep** is accounted for with simple sweep theory: only the flow across the swept quarter
+  chord line makes lift. This lowers the lift slope of swept surfaces, and makes a swept wing
+  roll away from a sideslip, like dihedral does.
 - The strips interact through a **nonlinear lifting line**: each carries a horseshoe vortex,
   whose trailing vortices induce downwash on all strips. This gives the loss of lift towards the
   tips, induced drag, the downwash of the wing on the tail, and with that the center of lift as it
   moves with the flow and the controls. No flow is simulated: it is a small system of equations,
   solved iteratively from the previous step.
+- The **wake** leaves the trailing edges along the flow, so the downwash at the tail follows the
+  angle of attack and the sideslip. The tail sees the wake the wing shed a moment ago, as it
+  takes that long to get there, which adds to the damping in pitch.
+- Beyond the **stall**, the vortex strengths are smoothed along the span where the lift falls
+  with the angle of attack, so the stall spreads smoothly, from where it starts, such as the
+  root of a rectangular wing.
 - **Control surfaces** are flaps that change the effective camber of their strips, after thin
-  airfoil theory, and lose effectiveness at large deflections.
-- **Bodies** have crossflow and axial drag along their length.
-- **Rotors** have thrust and torque coefficients that fall off with the advance ratio, driven by
-  a brushless motor model with its own inertia. This gives the throttle a realistic delay, and
-  the airframe the reaction torque and gyroscopic moments of its rotors. The battery sags under
-  load.
+  airfoil theory, and lose effectiveness at large deflections. They raise the maximum lift by
+  less than the lift they add, so that landing flaps lower the stall speed.
+- **Bodies** have crossflow and axial drag along their length, and the lift of slender body
+  theory, which turns them across the flow (the Munk moment) and makes a fuselage destabilizing.
+- **Rotors** have thrust and power coefficients by the advance ratio, either from a simple model
+  or a table of measurements. They are driven by a brushless motor, whose battery sags under
+  load, or by a piston engine, whose power falls with the density of the air. The rotor has an
+  inertia of its own, which gives the throttle a realistic delay, and the airframe the reaction
+  torque and gyroscopic moments of its rotors. With the engine off, a propeller windmills. Surfaces and bodies behind a rotor are in its **slipstream**, after momentum theory, so
+  a tail behind a propeller keeps some authority even without airspeed.
 - **Actuators** follow their commands with a first order response and a rate limit.
 - **Wind** is anything implementing `WindField`, which may vary in space and time. For now there
   is a constant wind.
@@ -86,12 +99,13 @@ specific force in the body frame, position, velocity, attitude, airspeed and bat
 |---|---|
 | [`uav.ron`](assets/aircraft/uav.ron) | a 2 m UAV with a top-mounted wing, a conventional tail and a pusher propeller above the wing |
 | [`flying_wing.ron`](assets/aircraft/flying_wing.ron) | a 1.5 m flying wing with elevons, winglets with rudders, and a pusher propeller at the back |
+| [`cessna172.ron`](assets/aircraft/cessna172.ron) | a Cessna 172P at its maximum weight, compared with the real one, see below |
 
 ```bash
 cargo run --release -- --aircraft assets/aircraft/flying_wing.ron
 ```
 
-Both are stable without a pilot: `cargo test` checks for every aircraft that its center of
+The two small aircraft are stable without a pilot: `cargo test` checks for each that its center of
 gravity is ahead of its neutral point, that it is trimmed for a sensible speed with the controls
 centered, that it glides hands off and holds a bank without spiraling, and that each stick turns
 it the right way. The flying wing is stable in pitch without a tail through its sweep and
@@ -100,12 +114,52 @@ washout, which make the tips act as a tail, and its reflexed airfoil.
 Each comes with ArduPlane parameters, such as the elevon outputs of the flying wing, in the
 `.parm` file next to it.
 
+### The Cessna 172P
+
+The Cessna is built from published data: the dimensions, weights, engine and propeller of its
+Pilot's Operating Handbook, the tail and control surface areas of Jane's, the moments of
+inertia and propeller coefficients of the JSBSim model, and the airfoil sections of NACA.
+Where no data was to be had, three inputs are calibrated, each against a single figure of the
+handbook: the drag of the engine cooling and what sticks out (one cruise speed), the propeller
+at low speed (the static rpm and the climb at sea level), and the windmilling propeller (the
+glide ratio).
+
+[`tests/cessna172.rs`](tests/cessna172.rs) flies it like a test pilot would and compares it with
+the handbook and with flight tests, and prints the comparison with `cargo test --release --test
+cessna172 -- --nocapture`:
+
+- **Cruise**: within 1 kt of the cruise performance table at all altitudes and engine speeds,
+  with the engine power within 5 % of the rated power. High up, full throttle gives a little
+  less rpm than the handbook, such as 2570 instead of 2650 at 8000 ft, and so up to 5 kt less.
+- **Climb**: within 10 % up to 6000 ft, but declining more slowly with altitude than the
+  handbook, by 90 ft/min at 12000 ft, so that the service ceiling is 15500 ft instead of 13000.
+  The best climb speed is 79 KIAS, the handbook gives 76.
+- **Stall**: 52 KCAS with the flaps up, the handbook 51 to 52, and 48.5 with the flaps at 30°,
+  the handbook 46. The slotted flaps of the Cessna keep more of their lift at the stall than
+  the plain flaps of the simulation.
+- **Glide**: the best glide speed is 65 KIAS, as in the handbook.
+- **Maximum speed**: 122 kt at sea level, the handbook 123.
+- **Phugoid**: a period of 29 s, damped by about 0.1, where flight tests found 33 s, and 35 to
+  40 s, heavily damped, with the elevator free to float rather than held.
+- **Lateral**: rolls into a rudder only turn, keeps the slip ball centered in an aileron only
+  turn, and slowly spirals into a dive after a nudge of the rudder, as the AAIB found in its
+  flight trial (bulletin 12/2020), in 18 s rather than 10 to 15.
+
+```bash
+cargo run --release -- --aircraft assets/aircraft/cessna172.ron
+```
+
 ## Aircraft definitions
 
 Aircraft are defined in [RON](https://github.com/ron-rs/ron), see
 [`assets/aircraft/uav.ron`](assets/aircraft/uav.ron) and the documented schema in
 [`src/sim/config.rs`](src/sim/config.rs). Positions are in a forward-right-down frame with any
 origin, angles in degrees.
+
+The definition is reloaded whenever it is saved, also by `sim-headless`. The aircraft carries on
+from where it is, held or in flight, with its controls and motors as they were. A definition
+with errors is reported in the flight panel, and the aircraft flies on as it was until it is
+fixed.
 
 - `mass`, `center_of_gravity` and `inertia` about it.
 - `airfoils`: by name, either `Parametric` (lift slope, zero lift angle, drag polar, pitching
@@ -117,8 +171,9 @@ origin, angles in degrees.
   antisymmetrically (ailerons) or by another actuator. A fin is a section with a dihedral of 90°.
 - `bodies`: fuselages and pods, as a radius profile along their length.
 - `drag`: other drag, such as landing gear or multicopter arms.
-- `rotors`: propellers with their motor, spin direction and throttle actuator. Multicopters are
-  rotors pointing up.
+- `rotors`: propellers with their coefficients, an electric `motor` or a piston `engine`, spin
+  direction and throttle actuator. Multicopters are rotors pointing up.
+- `launch_speed`: the airspeed to launch at, unless given on the command line.
 - `actuators`: servos and speed controllers, with their ArduPilot servo channel, pulse widths,
   dynamics, and how the pilot's sticks drive them (including mixes, such as for elevons).
 - `visual`: `Generated` from the geometry above, or a `Gltf` model.

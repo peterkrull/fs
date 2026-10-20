@@ -8,6 +8,10 @@ use super::config::Airfoil;
 const CD_90: f64 = 1.98;
 /// How sharply attached flow gives way to separated flow around the stall angles, per radian.
 const STALL_SHARPNESS: f64 = 50.0;
+/// A flap lowers the stall angle by this fraction of the angle of attack it adds, and so
+/// raises the maximum lift by the rest. Plain flaps keep around 60 % of the lift they add up to
+/// the stall (DATCOM).
+const FLAP_STALL_SHIFT: f64 = 0.4;
 /// Range over which a table blends into flat plate behavior beyond its last entry.
 const TABLE_BLEND: f64 = 10.0 * PI / 180.0;
 
@@ -32,10 +36,10 @@ pub struct AirfoilModel {
 enum Kind {
     Parametric {
         lift_slope: f64,
-        zero_lift_angle: f64,
         cd_min: f64,
         cd_k: f64,
         cm: f64,
+        zero_lift_angle: f64,
         stall_positive: f64,
         stall_negative: f64,
     },
@@ -52,10 +56,10 @@ impl AirfoilModel {
         match config {
             Airfoil::Parametric {
                 lift_slope,
-                zero_lift_angle,
                 cd_min,
                 cd_k,
                 cm,
+                zero_lift_angle,
                 stall_positive,
                 stall_negative,
                 ..
@@ -68,10 +72,10 @@ impl AirfoilModel {
                 Ok(Self {
                     kind: Kind::Parametric {
                         lift_slope: *lift_slope,
-                        zero_lift_angle: zero_lift_angle.to_radians(),
                         cd_min: *cd_min,
                         cd_k: *cd_k,
                         cm: *cm,
+                        zero_lift_angle: zero_lift_angle.to_radians(),
                         stall_positive: stall_positive.to_radians(),
                         stall_negative: stall_negative.to_radians(),
                     },
@@ -114,27 +118,55 @@ impl AirfoilModel {
         }
     }
 
+    /// Drag coefficient at zero lift, which is mostly skin friction.
+    pub fn cd_zero(&self) -> f64 {
+        self.cd_zero
+    }
+
     /// Coefficients at an angle of attack in radians, of any magnitude.
     pub fn coefficients(&self, alpha: f64) -> Coefficients {
-        let alpha = wrap_angle(alpha);
+        self.swept_coefficients(alpha, 1.0, 0.0)
+    }
+
+    /// Coefficients of the section across a surface swept by an angle `Λ`, given `cos Λ`, at an
+    /// angle of attack in that section.
+    ///
+    /// The airfoil is defined in the streamwise section. After simple sweep theory, the section
+    /// across the sweep has the same camber over a chord shorter by `cos Λ`, which raises its
+    /// zero lift and stall angles, and its lift and moment coefficients, by about `1 / cos Λ`.
+    /// The attached flow coefficients are therefore those of the streamwise section at the
+    /// equivalent angle, scaled up. The flat plate has no camber, and is the same either way.
+    ///
+    /// A flap adds `flap_alpha` to the angle of attack of the attached flow, but less to the
+    /// angle at which the flow separates, see [`FLAP_STALL_SHIFT`].
+    pub fn swept_coefficients(&self, alpha: f64, sweep_cos: f64, flap_alpha: f64) -> Coefficients {
+        let k = sweep_cos.clamp(0.1, 1.0);
+        // Keeps the quadrant, so that ±90° and 180° stay where they are
+        let equivalent = |alpha: f64| {
+            let alpha = wrap_angle(alpha);
+            (alpha.sin() * k).atan2(alpha.cos())
+        };
+        let stall = equivalent(alpha + FLAP_STALL_SHIFT * flap_alpha);
+        let alpha = wrap_angle(alpha + flap_alpha);
+        let equivalent = equivalent(alpha);
         match &self.kind {
             &Kind::Parametric {
                 lift_slope,
-                zero_lift_angle,
                 cd_min,
                 cd_k,
                 cm,
+                zero_lift_angle,
                 stall_positive,
                 stall_negative,
             } => {
-                let cl = lift_slope * (alpha - zero_lift_angle);
+                let cl = lift_slope * (equivalent - zero_lift_angle);
                 let attached = Coefficients {
-                    cl,
+                    cl: cl / k,
                     cd: cd_min + cd_k * cl * cl,
-                    cm,
+                    cm: cm / k,
                     separation: 0.0,
                 };
-                let separation = separation(alpha, stall_positive, stall_negative);
+                let separation = separation(stall, stall_positive, stall_negative);
                 blend(attached, flat_plate(alpha, self.cd_zero), separation)
             }
             Kind::Table {
@@ -144,20 +176,22 @@ impl AirfoilModel {
                 cm,
             } => {
                 let (first, last) = (angles[0], angles[angles.len() - 1]);
-                let clamped = alpha.clamp(first, last);
+                // The table moves by as much as the stall, and the rest of the lift of the
+                // flap adds to it
+                let clamped = stall.clamp(first, last);
                 let i = angles
                     .partition_point(|a| *a <= clamped)
                     .clamp(1, angles.len() - 1);
                 let t = (clamped - angles[i - 1]) / (angles[i] - angles[i - 1]);
                 let lerp = |v: &[f64]| v[i - 1] + (v[i] - v[i - 1]) * t;
                 let tabled = Coefficients {
-                    cl: lerp(cl),
+                    cl: (lerp(cl) + self.lift_slope() * (equivalent - stall)) / k,
                     cd: lerp(cd),
-                    cm: lerp(cm),
+                    cm: lerp(cm) / k,
                     separation: 0.0,
                 };
                 // Beyond the table, blend into the flat plate
-                let outside = (first - alpha).max(alpha - last).max(0.0);
+                let outside = (first - stall).max(stall - last).max(0.0);
                 let weight = smoothstep(outside / TABLE_BLEND);
                 blend(tabled, flat_plate(alpha, self.cd_zero), weight)
             }
@@ -297,6 +331,27 @@ mod tests {
         // About 0.6 degrees of angle of attack per degree of a 25% flap
         assert!((alpha / 10f64.to_radians() - 0.6).abs() < 0.05, "{alpha}");
         assert!(cm < 0.0 && cd > 0.0);
+    }
+
+    /// A flap adds lift at any angle of attack, and less of it at the stall, which it brings
+    /// forward.
+    #[test]
+    fn flaps_raise_maximum_lift() {
+        let airfoil = cambered();
+        let peak = |flap: f64| {
+            (0..400)
+                .map(|i| f64::to_radians(i as f64 * 0.05))
+                .map(|alpha| (airfoil.swept_coefficients(alpha, 1.0, flap).cl, alpha))
+                .fold((f64::MIN, 0.0), |a, b| if b.0 > a.0 { b } else { a })
+        };
+        let flap = 0.15;
+        let ((clean, clean_angle), (flapped, flapped_angle)) = (peak(0.0), peak(flap));
+        let gain = (flapped - clean) / (5.7 * flap);
+        assert!(
+            (0.5..0.7).contains(&gain),
+            "{clean} to {flapped}, {gain} of the lift"
+        );
+        assert!(flapped_angle < clean_angle);
     }
 
     #[test]

@@ -45,13 +45,18 @@ pub(super) struct Blades {
 #[derive(Component)]
 pub(super) struct Disc(usize);
 
+/// Spawn the model of the aircraft, replacing the previous one after a reload.
 pub(super) fn spawn(
     mut commands: Commands,
     flight: Res<Flight>,
+    previous: Query<Entity, With<AircraftRoot>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     assets: Res<AssetServer>,
 ) {
+    for entity in &previous {
+        commands.entity(entity).despawn();
+    }
     let model = &flight.model;
     let material = |materials: &mut Assets<StandardMaterial>, color: Color| {
         materials.add(StandardMaterial {
@@ -220,10 +225,14 @@ pub(super) fn update(
     }
 
     for (blade, mut transform, mut visibility) in &mut blades {
-        let Some(state) = flight.snapshot.rotors.get(blade.rotor) else {
+        // Right after a reload, the model may already be that of the new aircraft
+        let (Some(state), Some(rotor)) = (
+            flight.snapshot.rotors.get(blade.rotor),
+            flight.model.rotors.get(blade.rotor),
+        ) else {
             continue;
         };
-        let axis = flight.model.rotors[blade.rotor].axis.as_vec3();
+        let axis = rotor.axis.as_vec3();
         transform.rotation = Quat::from_axis_angle(axis, state.angle as f32) * blade.base;
         let blurred = state.speed / std::f64::consts::TAU > BLUR_SPEED;
         visibility.set_if_neq(if blurred {

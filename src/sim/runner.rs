@@ -54,6 +54,8 @@ pub struct LinkStatus {
 
 struct Shared {
     snapshot: Snapshot,
+    /// An aircraft to carry on with, see [`Simulation::replace_aircraft`].
+    replacement: Option<Simulation>,
     commands: Vec<f64>,
     ground: f64,
     requests: Vec<Request>,
@@ -74,6 +76,7 @@ impl SimHandle {
         };
         let shared = Arc::new(Mutex::new(Shared {
             snapshot: snapshot(&simulation, None, 0.0),
+            replacement: None,
             commands: simulation.actuators.commands().to_vec(),
             ground: simulation.ground,
             requests: Vec::new(),
@@ -109,6 +112,12 @@ impl SimHandle {
         self.lock().ground = height;
     }
 
+    /// Carry on with another aircraft from where the current one is, such as after its
+    /// definition was edited.
+    pub fn replace_aircraft(&self, simulation: Simulation) {
+        self.lock().replacement = Some(simulation);
+    }
+
     pub fn request(&self, request: Request) {
         self.lock().requests.push(request);
     }
@@ -132,6 +141,9 @@ impl Drop for SimHandle {
 /// Apply what the owner of the handle asked for, returning whether to stop.
 fn sync_inputs(simulation: &mut Simulation, shared: &Mutex<Shared>, commands: bool) -> bool {
     let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(next) = shared.replacement.take() {
+        simulation.replace_aircraft(next);
+    }
     simulation.ground = shared.ground;
     if commands {
         simulation.actuators.set_commands(&shared.commands);

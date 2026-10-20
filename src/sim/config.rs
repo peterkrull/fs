@@ -3,7 +3,11 @@
 //! All positions and directions are in the model frame: `x` forward, `y` right and `z` down
 //! (FRD), in meters, relative to any origin. Angles are in degrees.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use serde::Deserialize;
 
@@ -18,6 +22,9 @@ pub struct AircraftConfig {
     pub center_of_gravity: Vec3,
     /// Moments of inertia about the center of gravity, in body axes.
     pub inertia: Inertia,
+    /// Airspeed in m/s to launch the aircraft at, unless another is given on the command line.
+    #[serde(default)]
+    pub launch_speed: Option<f64>,
     /// Airfoils by name, referred to by the lifting surfaces.
     #[serde(default)]
     pub airfoils: BTreeMap<String, Airfoil>,
@@ -49,6 +56,49 @@ impl AircraftConfig {
             .from_str(text)
             .map_err(|err| err.to_string())
     }
+}
+
+/// Watches an aircraft definition for changes. It compares modification times, which works
+/// both with editors that write the file in place and with those that replace it.
+pub struct Watcher {
+    path: PathBuf,
+    /// Modification time of the definition when it was last loaded, and when last polled.
+    loaded: Option<SystemTime>,
+    polled: Option<SystemTime>,
+}
+
+impl Watcher {
+    /// Starts out with the definition as it is now, assuming it was just loaded.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let modified = modified(&path);
+        Self {
+            path,
+            loaded: modified,
+            polled: modified,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The definition, if it changed since it was last loaded. To not read a file that is
+    /// still being written, it is only loaded once it is unchanged since the previous poll.
+    pub fn poll(&mut self) -> Option<Result<AircraftConfig, String>> {
+        let modified = modified(&self.path);
+        let settled = modified == self.polled;
+        self.polled = modified;
+        if modified.is_none() || modified == self.loaded || !settled {
+            return None;
+        }
+        self.loaded = modified;
+        Some(AircraftConfig::load(&self.path))
+    }
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// Moments of inertia in kg m². `ixz` is the product of inertia `∫ x z dm`.
@@ -238,7 +288,7 @@ pub struct DragElement {
     pub cd_area: Vec3,
 }
 
-/// A propeller or rotor, driven by an electric motor.
+/// A propeller or rotor, driven by an electric motor or a piston engine.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rotor {
@@ -250,17 +300,54 @@ pub struct Rotor {
     /// Direction of rotation, as seen from behind, looking in the direction of the thrust.
     pub spin: Spin,
     /// Static thrust coefficient, `T = ct ρ n² D⁴` with `n` in revolutions per second.
+    /// Unless the coefficients are given as a `table`.
+    #[serde(default)]
     pub ct: f64,
     /// Static power coefficient, `P = cp ρ n³ D⁵`.
+    #[serde(default)]
     pub cp: f64,
     /// Advance ratio `J = V / (n D)` at which the thrust vanishes, about the pitch over the
-    /// diameter of the propeller.
+    /// diameter of the propeller. Below it, the thrust falls linearly, and the power
+    /// quadratically.
+    #[serde(default)]
     pub zero_thrust_advance: f64,
+    /// Measured thrust and power coefficients by advance ratio, in place of the above.
+    #[serde(default)]
+    pub table: Option<PropellerTable>,
     /// Moment of inertia of the propeller and the rotating parts of the motor, in kg m².
     pub inertia: f64,
-    pub motor: Motor,
-    /// The actuator setting the throttle of the motor.
+    /// What drives the rotor: a brushless `motor`, or a piston `engine`.
+    #[serde(default)]
+    pub motor: Option<Motor>,
+    #[serde(default)]
+    pub engine: Option<Engine>,
+    /// The actuator setting the throttle of the motor or engine.
     pub throttle: String,
+}
+
+/// Coefficients of a propeller by advance ratio `J = V / (n D)`, as `ct` and `cp` above.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropellerTable {
+    pub advance: Vec<f64>,
+    pub ct: Vec<f64>,
+    pub cp: Vec<f64>,
+}
+
+/// A piston engine, whose torque at full throttle is about the same at any speed, and falls
+/// with the density of the air, as it takes in less of it. The throttle sets the torque,
+/// like the manifold pressure does. At zero throttle the engine produces no power, so the
+/// propeller windmills against its friction, as with a failed engine.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Engine {
+    /// Rated brake power at sea level in watts, at `rpm`.
+    pub power: f64,
+    pub rpm: f64,
+    /// Friction and pumping losses at the rated speed, as a fraction of the rated torque,
+    /// which grow with the speed.
+    #[serde(default = "default_friction")]
+    pub friction: f64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -438,6 +525,54 @@ fn default_cd_crossflow() -> f64 {
 fn default_cd_axial() -> f64 {
     0.15
 }
+fn default_friction() -> f64 {
+    0.1
+}
 fn default_scale() -> f64 {
     1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BALL: &str = r#"(name: "ball", mass: 1.0, center_of_gravity: (0.0, 0.0, 0.0),
+        inertia: (ixx: 0.1, iyy: 0.1, izz: 0.1), actuators: [])"#;
+
+    #[test]
+    fn watcher_loads_saved_definitions_once_settled() {
+        let dir = std::env::temp_dir().join(format!("worldmap-watcher-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ball.ron");
+        let write = |text: &str, seconds: u64| {
+            std::fs::write(&path, text).unwrap();
+            let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        write(BALL, 1000);
+        let mut watcher = Watcher::new(&path);
+        assert!(watcher.poll().is_none());
+
+        // Saved, but only loaded once it stays the same for a poll
+        write(&BALL.replace("1.0,", "2.0,"), 2000);
+        assert!(watcher.poll().is_none());
+        let config = watcher.poll().unwrap().unwrap();
+        assert_eq!(config.mass, 2.0);
+        assert!(watcher.poll().is_none());
+
+        // Errors are reported, and the next save is loaded again
+        write("(name: ", 3000);
+        assert!(watcher.poll().is_none());
+        assert!(watcher.poll().unwrap().is_err());
+        write(BALL, 4000);
+        assert!(watcher.poll().is_none());
+        assert!(watcher.poll().unwrap().is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
