@@ -1,0 +1,224 @@
+// A 35% scale Sbach 342 (XtremeAir XA42) in the style of a Red Bull racer: a carbon composite
+// low-wing aerobatic monoplane with a 2.6 m span, near-full-span ailerons, a large tail, and a
+// 120 cc flat twin driving a 28 inch propeller. Unlike the full size aircraft it is meant to be
+// flown from the ground, so it is light, overpowered, and has the short-coupled, low-inertia
+// feel of a large-scale RC aerobat. The controls are set up for big throws and fast servos, so
+// it rolls, snaps and changes direction immediately.
+//
+// The model frame is forward-right-down (x forward, y right, z down), in meters, with its origin
+// at the tip of the spinner. Angles are in degrees. The servo channels follow ArduPlane: aileron
+// on 1, elevator on 2, throttle on 3 and rudder on 4. A positive actuator value rolls right,
+// pitches up and yaws right.
+//
+// Sources:
+// - XtremeAir Sbach 342 type certificate data sheet and airplane flight manual: span 7.50 m,
+//   length 6.67 m, wing area 11.25 m², aerobatic mass 850 kg, +-10 g, 450°/s roll rate, and the
+//   PS-1-16/PS-1-09 wing and DU86-MOD1 tail sections. The geometry below is that aircraft at
+//   35% scale.
+// - Pilot-RC Sbach 342 36% (2.70 m span, 2.43 m length, 1.48 m², 12.5 kg): the mass, wing
+//   loading and control layout of a large-scale model of this size.
+// - DA-120: 8.8 kW (12 hp) at 6500 rpm, with a 28x12 two-blade propeller.
+(
+    name: "Sbach 342 35%",
+    mass: 12.0,
+    // About 28% of the mean aerodynamic chord behind its leading edge, close enough to the
+    // neutral point for crisp pitch response while still flying hands off.
+    center_of_gravity: (-0.545, 0.0, 0.02),
+    // A light composite airframe, with most of the mass in the wing and the engine: low enough
+    // in roll to accelerate quickly, but with enough pitch and yaw inertia to smooth the snaps.
+    inertia: (ixx: 4.5, iyy: 6.5, izz: 8.0),
+    // 97 km/h, a comfortable aerobatic cruise
+    launch_speed: 27.0,
+
+    airfoils: {
+        // The PS-1-16 root section: symmetric, 16% thick, with a sharp stall and little
+        // pitching moment of its own. The lift slope is reduced a little for the low Reynolds
+        // number of a 2.6 m model.
+        "ps-1-16": Parametric(
+            lift_slope: 5.6,
+            cd_min: 0.0085,
+            cd_k: 0.008,
+            stall_positive: 15.0,
+            stall_negative: -15.0,
+            shape: (thickness: 0.16),
+        ),
+        // The PS-1-09 tip section, which is thinner and stalls a little later
+        "ps-1-09": Parametric(
+            lift_slope: 5.5,
+            cd_min: 0.008,
+            cd_k: 0.008,
+            stall_positive: 16.0,
+            stall_negative: -16.0,
+            shape: (thickness: 0.12),
+        ),
+        // DU86-MOD1, the symmetric tail section
+        "du86": Parametric(
+            lift_slope: 5.8,
+            cd_min: 0.008,
+            cd_k: 0.008,
+            stall_positive: 14.0,
+            stall_negative: -14.0,
+            shape: (thickness: 0.09),
+        ),
+    },
+
+    surfaces: [
+        (
+            // 1.35 m² over 2.625 m, with a straight leading edge and a taper of about 0.7
+            name: "wing",
+            airfoil: "ps-1-16",
+            // The leading edge at the root, just behind the wing fairing
+            root: (-0.38, 0.0, 0.06),
+            root_chord: 0.60,
+            incidence: 0.75,
+            mirror: true,
+            sections: [
+                (
+                    span: 0.55,
+                    tip_chord: 0.53,
+                    sweep: 1.5,
+                    dihedral: 1.0,
+                    cells: 6,
+                    controls: [
+                        // Nearly full-span ailerons, with a big chord and 30° of throw. On the
+                        // right wing a positive stick moves the trailing edge up.
+                        (
+                            actuator: "aileron",
+                            deflection: -30.0,
+                            chord_fraction: 0.28,
+                            extent: (0.55, 1.0),
+                            mirror: Antisymmetric,
+                        ),
+                    ],
+                ),
+                (
+                    span: 0.7625,
+                    tip_chord: 0.42,
+                    sweep: 2.0,
+                    dihedral: 1.0,
+                    cells: 8,
+                    airfoil: "ps-1-09",
+                    controls: [
+                        (
+                            actuator: "aileron",
+                            deflection: -30.0,
+                            chord_fraction: 0.28,
+                            extent: (0.0, 0.97),
+                            mirror: Antisymmetric,
+                        ),
+                    ],
+                ),
+            ],
+        ),
+        (
+            // 0.25 m² over 0.96 m, with a 0.42 chord elevator
+            name: "horizontal tail",
+            airfoil: "du86",
+            root: (-1.70, 0.0, -0.01),
+            root_chord: 0.34,
+            incidence: -0.5,
+            mirror: true,
+            sections: [
+                (
+                    span: 0.48,
+                    tip_chord: 0.18,
+                    sweep: 10.0,
+                    cells: 5,
+                    controls: [
+                        // 32° each way, enough for a hard snap and to stop a vertical downline
+                        (actuator: "elevator", deflection: -32.0, chord_fraction: 0.42),
+                    ],
+                ),
+            ],
+        ),
+        (
+            // 0.17 m² over 0.55 m, with a large, powerful rudder
+            name: "fin",
+            airfoil: "du86",
+            root: (-1.64, 0.0, -0.08),
+            root_chord: 0.42,
+            sections: [
+                (
+                    span: 0.55,
+                    tip_chord: 0.20,
+                    sweep: 30.0,
+                    dihedral: 90.0,
+                    cells: 5,
+                    controls: [(actuator: "rudder", deflection: 32.0, chord_fraction: 0.42)],
+                ),
+            ],
+        ),
+    ],
+
+    bodies: [
+        (
+            // The spinner, cowl, canopy and tail cone as one body of revolution, 0.32 m across
+            // at its widest
+            name: "fuselage",
+            nose: (0.0, 0.0, 0.0),
+            length: 2.33,
+            profile: [
+                (0.0, 0.0), (0.02, 0.055), (0.05, 0.09), (0.10, 0.13), (0.17, 0.155),
+                (0.27, 0.16), (0.38, 0.15), (0.52, 0.13), (0.68, 0.10), (0.84, 0.06),
+                (1.0, 0.025),
+            ],
+            cells: 16,
+        ),
+    ],
+
+    drag: [
+        // Carbon landing gear legs and wheels, and a small tailwheel
+        (name: "right main gear", position: (-0.50, 0.30, 0.34), cd_area: (0.006, 0.008, 0.012)),
+        (name: "left main gear", position: (-0.50, -0.30, 0.34), cd_area: (0.006, 0.008, 0.012)),
+        (name: "tailwheel", position: (-2.10, 0.0, 0.22), cd_area: (0.002, 0.002, 0.003)),
+        // Cowl cooling, the canopy, the exhaust and the antennas
+        (name: "cooling and miscellaneous", position: (0.25, 0.0, 0.0), cd_area: (0.012, 0.0, 0.0)),
+    ],
+
+    rotors: [
+        (
+            name: "propeller",
+            // A 28x12 two-blade propeller on the nose
+            position: (0.02, 0.0, 0.0),
+            axis: (1.0, 0.0, 0.0),
+            diameter: 0.7112,
+            // A DA-120 turns counterclockwise as seen from the cockpit
+            spin: CounterClockwise,
+            table: (
+                advance: [
+                    0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+                ],
+                ct: [
+                    0.075, 0.072, 0.068, 0.062, 0.054, 0.044, 0.031, 0.016, 0.0, -0.018,
+                    -0.040,
+                ],
+                cp: [
+                    0.031, 0.032, 0.032, 0.0315, 0.0305, 0.0285, 0.0255, 0.0215, 0.016, 0.009,
+                    0.0,
+                ],
+            ),
+            // The propeller, spinner and the rotating parts of the engine
+            inertia: 0.015,
+            // 12 hp at 6500 rpm
+            engine: (power: 8800.0, rpm: 6500.0),
+            throttle: "throttle",
+        ),
+    ],
+
+    // Fast digital servos, with the throttle on the carburettor
+    actuators: [
+        (name: "aileron", channel: 1, time_constant: 0.03, slew_rate: 10.0, input: [(Roll, 1.0)]),
+        (name: "elevator", channel: 2, time_constant: 0.03, slew_rate: 10.0, input: [(Pitch, 1.0)]),
+        (
+            name: "throttle",
+            kind: Throttle,
+            channel: 3,
+            time_constant: 0.12,
+            slew_rate: 3.0,
+            input: [(Throttle, 1.0)],
+        ),
+        (name: "rudder", channel: 4, time_constant: 0.03, slew_rate: 10.0, input: [(Yaw, 1.0)]),
+    ],
+
+    visual: Generated,
+)

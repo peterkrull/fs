@@ -1,0 +1,15 @@
+# ArduPlane parameters for the 35% Sbach 342 of sbach35.ron, on top of the defaults for planes
+# (Tools/autotest/models/plane.parm in the ArduPilot repository).
+SERVO1_FUNCTION 4
+SERVO2_FUNCTION 19
+SERVO3_FUNCTION 70
+SERVO4_FUNCTION 21
+AIRSPEED_CRUISE 30
+AIRSPEED_MIN    20
+AIRSPEED_MAX    58
+ARSPD_USE       1
+TRIM_THROTTLE   35
+ROLL_LIMIT_DEG  60
+PTCH_LIM_MAX_DEG 45
+PTCH_LIM_MIN_DEG -40
+WP_LOITER_RAD   150

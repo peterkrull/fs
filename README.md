@@ -100,6 +100,7 @@ specific force in the body frame, position, velocity, attitude, airspeed and bat
 | [`uav.ron`](assets/aircraft/uav.ron) | a 2 m UAV with a top-mounted wing, a conventional tail and a pusher propeller above the wing |
 | [`flying_wing.ron`](assets/aircraft/flying_wing.ron) | a 1.5 m flying wing with elevons, winglets with rudders, and a pusher propeller at the back |
 | [`cessna172.ron`](assets/aircraft/cessna172.ron) | a Cessna 172P at its maximum weight, compared with the real one, see below |
+| [`sbach35.ron`](assets/aircraft/sbach35.ron) | a 35% scale Sbach 342 in the style of a Red Bull racer: 2.6 m span, 12 kg, near-full-span ailerons and a 120 cc flat twin |
 
 ```bash
 cargo run --release -- --aircraft assets/aircraft/flying_wing.ron
@@ -113,6 +114,12 @@ washout, which make the tips act as a tail, and its reflexed airfoil.
 
 Each comes with ArduPlane parameters, such as the elevon outputs of the flying wing, in the
 `.parm` file next to it.
+
+The Sbach is a large-scale aerobatic model rather than a slow UAV: it launches at 27 m/s, trims
+hands off at about 24 m/s, and rolls at around 450°/s at cruise. It has big, fast controls for
+snaps and quick direction changes, and its own parameters in `sbach35.parm`.
+[`tests/sbach35.rs`](tests/sbach35.rs) checks its static margin, glide, control response, roll
+rate and climb, and prints them with `cargo test --release --test sbach35 -- --nocapture`.
 
 ### The Cessna 172P
 
