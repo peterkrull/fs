@@ -290,10 +290,15 @@ struct MeshBuilder {
 }
 
 impl MeshBuilder {
-    fn quad(&mut self, a: DVec3, b: DVec3, c: DVec3, d: DVec3, origin: DVec3) {
-        for p in [a, b, c, a, c, d] {
+    fn triangle(&mut self, a: DVec3, b: DVec3, c: DVec3, origin: DVec3) {
+        for p in [a, b, c] {
             self.positions.push((p - origin).as_vec3().to_array());
         }
+    }
+
+    fn quad(&mut self, a: DVec3, b: DVec3, c: DVec3, d: DVec3, origin: DVec3) {
+        self.triangle(a, b, c, origin);
+        self.triangle(a, c, d, origin);
     }
 
     /// The part of a strip between `x0` and `x1` along its chord, relative to `origin`.
@@ -334,6 +339,20 @@ impl MeshBuilder {
                 );
             }
         }
+        // Close the ends of the strip. Where strips meet, their ends lie inside the surface
+        // and are never seen, but this also closes the tips, and the side of a strip which a
+        // deflected control surface next to it uncovers.
+        for end in [0, 1] {
+            for w in xs.windows(2) {
+                self.quad(
+                    section(end, w[0], 1.0),
+                    section(end, w[1], 1.0),
+                    section(end, w[1], -1.0),
+                    section(end, w[0], -1.0),
+                    origin,
+                );
+            }
+        }
     }
 
     /// A body of revolution backwards along the `x` axis from `nose`.
@@ -352,6 +371,15 @@ impl MeshBuilder {
                     ring(t1, r1, i),
                     DVec3::ZERO,
                 );
+            }
+        }
+        // Close the ends which are not points
+        for &(t, radius) in [profile.first(), profile.last()].into_iter().flatten() {
+            if radius > 0.0 {
+                let center = nose - DVec3::X * (length * t);
+                for i in 0..RING_POINTS {
+                    self.triangle(center, ring(t, radius, i), ring(t, radius, i + 1), DVec3::ZERO);
+                }
             }
         }
     }
