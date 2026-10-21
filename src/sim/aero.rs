@@ -415,15 +415,22 @@ impl Aerodynamics {
         self.lagged.clear();
         for (i, target) in strips.iter().enumerate() {
             for (j, source) in strips.iter().enumerate() {
-                let (bound, trailing) = horseshoe(target.center, source, i == j, downstream);
+                let width = (source.b - source.a).length();
+                let (bound, trailing) =
+                    horseshoe(target.center, source, i == j, downstream, 0.1 * width);
                 let distance = (target.center - source.center).dot(downstream);
                 self.influence[i * n + j] = bound;
                 match distance > LAG_CHORDS * source.chord {
+                    // Far downstream, the trailing vortices of a strip stand for the part of the
+                    // vortex sheet behind it, as wide as the strip. Seen from closer than that,
+                    // such as by a tail in the plane of the wing, they would make the downwash
+                    // of the sheet jagged, enough to stall single strips of the tail, so their
+                    // cores are as wide as the strip.
                     true => self.lagged.push(Lagged {
                         target: i,
                         source: j,
                         distance,
-                        velocity: trailing,
+                        velocity: horseshoe(target.center, source, false, downstream, width).1,
                     }),
                     false => self.influence[i * n + j] += trailing,
                 }
@@ -849,11 +856,15 @@ impl Strip {
 /// Velocity induced at `point` by a horseshoe vortex of unit strength on `strip`: a bound vortex
 /// from `a` to `b`, and trailing vortices, given separately. The trailing vortices run along the
 /// chord to the trailing edge, and leave from there in the direction `downstream`. The bound
-/// vortex does not induce a velocity on its own midpoint.
-fn horseshoe(point: DVec3, strip: &Strip, own: bool, downstream: DVec3) -> (DVec3, DVec3) {
-    // Regularizes the velocity close to vortex lines, such as where the wake of the wing
-    // passes the tail
-    let core = 0.1 * (strip.b - strip.a).length();
+/// vortex does not induce a velocity on its own midpoint. The vortex lines have a core radius,
+/// which regularizes the velocity close to them.
+fn horseshoe(
+    point: DVec3,
+    strip: &Strip,
+    own: bool,
+    downstream: DVec3,
+    core: f64,
+) -> (DVec3, DVec3) {
     // Leaving along the flow right from the bound vortex would skew the trailing vortices next
     // to the neighbouring strips in a sideslip, and make even a straight wing roll strongly
     let leg = |start: DVec3, edge: DVec3| {
@@ -1111,6 +1122,49 @@ mod tests {
             gradient_high < 0.99 * gradient_low,
             "downwash per angle of attack {gradient_low} at 4 deg, {gradient_high} at 12 deg"
         );
+    }
+
+    /// A tail in the plane of the wing, with strips narrower than those of the wing, which the
+    /// trailing vortices of the wing pass close to, sees a smooth downwash along its span.
+    #[test]
+    fn smooth_downwash_on_a_tail_in_the_wake() {
+        let config = AircraftConfig::parse(
+            r#"(
+                name: "wing and tail", mass: 1.0, center_of_gravity: (-0.35, 0.0, 0.0),
+                inertia: (ixx: 1.0, iyy: 1.0, izz: 1.0),
+                airfoils: {
+                    "cambered": Parametric(lift_slope: 6.283185, zero_lift_angle: -4.0,
+                        cd_min: 0.0, cd_k: 0.0, stall_positive: 13.0, stall_negative: -8.0),
+                    "thin": Parametric(lift_slope: 6.283185, cd_min: 0.0, cd_k: 0.0,
+                        stall_positive: 11.0, stall_negative: -11.0),
+                },
+                surfaces: [
+                    (name: "wing", airfoil: "cambered", root: (-0.25, 0.07, 0.0), root_chord: 0.3,
+                        mirror: true, sections: [(span: 0.53, tip_chord: 0.15, cells: 15)]),
+                    (name: "tail", airfoil: "thin", root: (-0.93, 0.0, 0.0), root_chord: 0.15,
+                        mirror: true, sections: [(span: 0.25, tip_chord: 0.11, cells: 8)]),
+                ],
+                actuators: [],
+            )"#,
+        )
+        .unwrap();
+        let mut aero = Aerodynamics::new(&config, &[]).unwrap();
+        // With the wake of the cambered wing in the plane of the tail
+        let steady = flow(0.0, 0.0);
+        let loads = (0..300).map(|_| aero.loads(&steady)).last().unwrap();
+        // Along the right half of the tail, from the root out
+        let mut tail: Vec<(f64, f64)> = aero
+            .strips
+            .iter()
+            .zip(&loads.strips)
+            .filter(|(strip, _)| strip.surface == 1 && strip.center.y > 0.0)
+            .map(|(strip, load)| (strip.center.y, load.alpha.to_degrees()))
+            .collect();
+        tail.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for three in tail.windows(3) {
+            let kink = (three[0].1 - 2.0 * three[1].1 + three[2].1).abs();
+            assert!(kink < 1.0, "angles of attack along the tail: {tail:?}");
+        }
     }
 
     /// The tail sees the downwash the wing shed a moment ago, so right after the angle of
