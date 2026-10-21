@@ -6,6 +6,7 @@ use bevy::{
 };
 
 use crate::{
+    atmosphere::Haze,
     camera::{Controls, View},
     sources::Source,
     terrain::{Terrain, TerrainSettings},
@@ -15,7 +16,7 @@ use crate::{
 const HELP: &str = "\
 Click: capture mouse   Esc: release   Right drag: look   Scroll: zoom or speed
 Free camera: W A S D fly   Space / C: up / down   Shift: faster
-T: toggle imagery   [ ]: move the sun   - =: level of detail
+T: toggle imagery   [ ]: move the sun   , .: haze   - =: level of detail
 F: freeze tiles   H: hide help";
 
 pub struct HudPlugin;
@@ -113,6 +114,7 @@ fn update(
     terrain: Res<Terrain>,
     tiles: Res<Tiles>,
     settings: Res<TerrainSettings>,
+    haze: Res<Haze>,
     mut stats: Single<&mut Text, (With<Stats>, Without<Attribution>)>,
     mut attribution: Single<&mut Text, (With<Attribution>, Without<Stats>)>,
 ) {
@@ -134,7 +136,7 @@ fn update(
         "{fps:.0} fps\n\
          {}   height {} (above ground {})\n\
          heading {heading:.0} deg   pitch {pitch:.0} deg   speed {}/s\n\
-         {}   detail {:.2} px/texel{}\n\
+         {}   detail {:.2} px/texel   haze {:.2}{}\n\
          tiles drawn {}   max zoom {}   in memory {}   building {}   coarsened {}\n\
          imagery {}   elevation {}   downloading {}   queued {}",
         coordinates(lon_lat.x.to_degrees(), lon_lat.y.to_degrees()),
@@ -143,6 +145,7 @@ fn update(
         distance(view.speed()),
         settings.imagery.name(),
         settings.lod_threshold,
+        haze.0,
         if settings.freeze { "   FROZEN" } else { "" },
         s.rendered,
         s.max_zoom,

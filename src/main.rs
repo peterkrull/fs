@@ -107,6 +107,12 @@ fn main() {
     {
         app.world_mut().resource_mut::<atmosphere::Sun>().lon = lon.to_radians();
     }
+    if let Some(haze) = std::env::var("WORLDMAP_HAZE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        app.insert_resource(atmosphere::Haze(haze));
+    }
 
     app.run();
 }

@@ -11,7 +11,10 @@ use bevy::{
     shader::{ShaderRef, load_shader_library},
 };
 
-use crate::mesh::{ATTRIBUTE_PARENT_NORMAL, ATTRIBUTE_PARENT_POSITION};
+use crate::{
+    mesh::{ATTRIBUTE_PARENT_NORMAL, ATTRIBUTE_PARENT_POSITION},
+    scattering::ScatteringLuts,
+};
 
 pub struct MaterialsPlugin;
 
@@ -39,9 +42,6 @@ pub struct TerrainParams {
     /// Multiplied with the imagery, or used in its place when there is none.
     pub base_color: Vec4,
     pub previous_color: Vec4,
-    /// Direction towards the sun in `xyz`. The lights of the view are not available to vertex
-    /// shaders, where the atmosphere is evaluated.
-    pub sun: Vec4,
     /// In `x`, how far the geometry has faded in from that of the parent tile, and in `y`, the
     /// imagery from the previous imagery, both from `0` to `1`.
     pub fade: Vec4,
@@ -51,14 +51,13 @@ pub struct TerrainParams {
 }
 
 impl TerrainParams {
-    pub fn new(planet_center: Vec3, base_color: Color, sun: Vec3) -> Self {
+    pub fn new(planet_center: Vec3, base_color: Color) -> Self {
         Self {
             uv_transform: Vec4::new(0.0, 0.0, 1.0, 0.0),
             previous_uv_transform: Vec4::new(0.0, 0.0, 1.0, 0.0),
             planet_center: planet_center.extend(0.0),
             base_color: base_color.to_linear().to_vec4(),
             previous_color: base_color.to_linear().to_vec4(),
-            sun: sun.extend(0.0),
             fade: Vec4::ONE,
             edges: Vec4::ZERO,
         }
@@ -77,6 +76,30 @@ pub struct TerrainMaterial {
     #[texture(3)]
     #[sampler(4)]
     pub previous: Option<Handle<Image>>,
+    #[texture(5)]
+    pub transmittance: Handle<Image>,
+    #[texture(6)]
+    pub irradiance: Handle<Image>,
+    #[texture(7, dimension = "3d")]
+    #[sampler(9)]
+    pub aerial_inscattering: Handle<Image>,
+    #[texture(8, dimension = "3d")]
+    pub aerial_transmittance: Handle<Image>,
+}
+
+impl TerrainMaterial {
+    /// Without imagery.
+    pub fn new(params: TerrainParams, luts: &ScatteringLuts) -> Self {
+        Self {
+            params,
+            imagery: None,
+            previous: None,
+            transmittance: luts.transmittance.clone(),
+            irradiance: luts.irradiance.clone(),
+            aerial_inscattering: luts.aerial_inscattering.clone(),
+            aerial_transmittance: luts.aerial_transmittance.clone(),
+        }
+    }
 }
 
 impl Material for TerrainMaterial {
@@ -119,6 +142,27 @@ pub struct SkyMaterial {
     /// Position of the camera relative to the center of the planet, in `xyz`.
     #[uniform(0)]
     pub camera: Vec4,
+    #[texture(1)]
+    pub transmittance: Handle<Image>,
+    #[texture(2)]
+    pub irradiance: Handle<Image>,
+    #[texture(3, dimension = "3d")]
+    #[sampler(5)]
+    pub aerial_inscattering: Handle<Image>,
+    #[texture(4, dimension = "3d")]
+    pub aerial_transmittance: Handle<Image>,
+}
+
+impl SkyMaterial {
+    pub fn new(luts: &ScatteringLuts) -> Self {
+        Self {
+            camera: Vec4::ZERO,
+            transmittance: luts.transmittance.clone(),
+            irradiance: luts.irradiance.clone(),
+            aerial_inscattering: luts.aerial_inscattering.clone(),
+            aerial_transmittance: luts.aerial_transmittance.clone(),
+        }
+    }
 }
 
 impl Material for SkyMaterial {

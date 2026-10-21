@@ -29,6 +29,9 @@ crossbeam-channel = "0.5"
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "fs"] }
 reqwest = "0.13.5"
 
+# For reading the lookup tables of the atmosphere back from the GPU
+half = "2"
+
 # For decoding tiles
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 

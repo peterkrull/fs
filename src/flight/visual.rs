@@ -11,6 +11,7 @@ use bevy::{
 
 use super::{DebugView, Flight};
 use crate::{
+    atmosphere::LightProbe,
     camera::View,
     sim::{
         aero::Strip,
@@ -69,7 +70,12 @@ pub(super) fn spawn(
     };
 
     let root = commands
-        .spawn((AircraftRoot, Transform::default(), Visibility::default()))
+        .spawn((
+            AircraftRoot,
+            LightProbe,
+            Transform::default(),
+            Visibility::default(),
+        ))
         .id();
     let parts = commands
         .spawn((

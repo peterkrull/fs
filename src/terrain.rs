@@ -35,12 +35,12 @@ use bevy::{
 };
 
 use crate::{
-    atmosphere::Sun,
     camera::{CameraSystems, View},
     fetch::Key,
     geo::{self, EARTH_RADIUS, MAX_HEIGHT, TileId},
     material::{TerrainMaterial, TerrainParams},
     mesh::{self, Elevation, TileMesh},
+    scattering::ScatteringLuts,
     sources::Source,
     tiles::Tiles,
 };
@@ -654,7 +654,7 @@ fn poll_meshes(
     mut terrain: ResMut<Terrain>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    sun: Res<Sun>,
+    luts: Res<ScatteringLuts>,
 ) {
     let terrain = terrain.as_mut();
     for node in terrain.nodes.values_mut() {
@@ -682,11 +682,10 @@ fn poll_meshes(
                 });
             }
             None => {
-                let material = materials.add(TerrainMaterial {
-                    params: TerrainParams::new(planet_center, PLACEHOLDER, sun.direction()),
-                    imagery: None,
-                    previous: None,
-                });
+                let material = materials.add(TerrainMaterial::new(
+                    TerrainParams::new(planet_center, PLACEHOLDER),
+                    &luts,
+                ));
                 let entity = commands
                     .spawn((
                         Mesh3d(mesh),
@@ -722,23 +721,10 @@ fn update_tiles(
     mut entities: Query<(&mut Transform, &mut Visibility)>,
     view: Res<View>,
     settings: Res<TerrainSettings>,
-    sun: Res<Sun>,
     time: Res<Time>,
 ) {
     let terrain = terrain.as_mut();
     let frame = terrain.frame;
-
-    if sun.is_changed() {
-        for built in terrain
-            .nodes
-            .values()
-            .filter_map(|node| node.built.as_ref())
-        {
-            if let Some(mut material) = materials.get_mut(&built.material) {
-                material.params.sun = sun.direction().extend(0.0);
-            }
-        }
-    }
 
     for (tile, node) in terrain.nodes.iter_mut() {
         let Some(built) = &mut node.built else {
@@ -910,15 +896,14 @@ fn spawn_caps(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    sun: Res<Sun>,
+    luts: Res<ScatteringLuts>,
 ) {
     for north in [true, false] {
         let (mesh, center) = mesh::build_cap_mesh(north, |_| 0.0);
-        let material = materials.add(TerrainMaterial {
-            params: TerrainParams::new((-center).as_vec3(), Color::WHITE, sun.direction()),
-            imagery: None,
-            previous: None,
-        });
+        let material = materials.add(TerrainMaterial::new(
+            TerrainParams::new((-center).as_vec3(), Color::WHITE),
+            &luts,
+        ));
         commands.spawn((
             Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(material.clone()),
@@ -952,12 +937,11 @@ fn update_caps(
     view: Res<View>,
     settings: Res<TerrainSettings>,
     time: Res<Time>,
-    sun: Res<Sun>,
 ) {
     // Follow the rims of the coarser tiles as their elevation streams in
     let now = time.elapsed_secs_f64();
     let rebuild = tiles.elevation_version != state.elevation_version && now - state.built > 1.0;
-    let recolor = state.imagery != Some(settings.imagery) || sun.is_changed();
+    let recolor = state.imagery != Some(settings.imagery);
 
     for (mut cap, mut transform, mut mesh3d) in &mut caps {
         if rebuild {
@@ -974,7 +958,6 @@ fn update_caps(
             material.params.planet_center = (-cap.center).as_vec3().extend(0.0);
             material.params.base_color =
                 cap_color(settings.imagery, cap.north).to_linear().to_vec4();
-            material.params.sun = sun.direction().extend(0.0);
         }
         transform.translation = (cap.center - view.position).as_vec3();
     }
