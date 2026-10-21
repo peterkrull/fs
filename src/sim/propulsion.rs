@@ -178,6 +178,20 @@ impl RotorModel {
         self.axis * (self.inertia * state.speed * self.spin)
     }
 
+    /// The current the rotor draws from the battery at a battery voltage `v`, as `a v - b` where
+    /// that is positive, given as `(a, b)`, or `None` if it does not draw from the battery. The
+    /// speed controller passes the throttle times the battery voltage on to the motor, and draws
+    /// the throttle times the current of the motor.
+    pub fn battery_load(&self, state: &RotorState, throttle: f64) -> Option<(f64, f64)> {
+        match self.drive {
+            Drive::Electric { kv, resistance, .. } => Some((
+                throttle * throttle / resistance,
+                throttle * state.speed / kv / resistance,
+            )),
+            Drive::Piston { .. } => None,
+        }
+    }
+
     /// Advance the rotor by `dt`, given its throttle, the battery voltage, the velocity of the
     /// air relative to the rotor in the body frame, and its density.
     pub fn step(
@@ -258,4 +272,20 @@ impl RotorModel {
             },
         }
     }
+}
+/// The voltage of a battery, of an open circuit voltage and an internal resistance, under
+/// loads that each draw a current of `a v - b`, where that is positive, at a voltage `v`, as
+/// [`RotorModel::battery_load`] gives them. The voltage falls the more current the loads draw,
+/// and they draw more the higher it is, so a single voltage balances the two.
+pub fn battery_voltage(open: f64, resistance: f64, loads: &[(f64, f64)]) -> f64 {
+    let current = |v: f64| loads.iter().map(|(a, b)| (a * v - b).max(0.0)).sum::<f64>();
+    let (mut low, mut high) = (0.0, open.max(0.0));
+    for _ in 0..60 {
+        let mid = 0.5 * (low + high);
+        match mid > open - resistance * current(mid) {
+            true => high = mid,
+            false => low = mid,
+        }
+    }
+    0.5 * (low + high)
 }

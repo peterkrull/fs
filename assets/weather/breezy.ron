@@ -1,0 +1,17 @@
+// A breezy day: a steady wind, gusting now and then, and light turbulence.
+//
+// Fly in it with `--weather assets/weather/breezy.ron`. It is reloaded whenever it is saved.
+// Everything left out has its default, see `src/sim/weather/mod.rs`, and `()` is calm air.
+(
+    // The same seed gives the same gusts and turbulence
+    seed: 1,
+    // The wind above the boundary layer: from a direction in degrees, in m/s
+    wind: (from: 250, speed: 8),
+    // Below this height above the terrain, the wind slows down towards the ground, and turns
+    // towards low pressure, here by up to 20 degrees
+    boundary_layer: (height: 300, roughness: 0.1, turning: 20),
+    // Standard deviation of the vertical gusts, in m/s: light 0.77, moderate 1.54, severe 2.31
+    turbulence: 0.1,
+    // Gusts adding up to 5 m/s to the wind aloft, every 15 s at a place, for 4 s each
+    gusts: (speed: 10, interval: 15, duration: 4, radius: 200),
+)

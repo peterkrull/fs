@@ -15,7 +15,9 @@ cargo run --release -- --no-aircraft
 | `--aircraft PATH` | aircraft definition, default `assets/aircraft/uav.ron` |
 | `--spawn LAT,LON,ALT,HDG` | where the aircraft starts: degrees, meters above sea level, degrees |
 | `--launch-speed M/S` | airspeed when launched, default that of the aircraft, or 14 |
-| `--wind FROM,SPEED` | constant wind from a heading in degrees, in m/s |
+| `--weather PATH` | weather definition, see [Weather](#weather) |
+| `--wind FROM,SPEED` | wind above the boundary layer, from a heading in degrees, in m/s |
+| `--turbulence SEVERITY` | `light`, `moderate`, `severe`, or the intensity in m/s |
 | `--sitl [PORT]` | lockstep with ArduPilot SITL, default port 9002 |
 | `--radio ORDER` | use game controllers as RC radios with this channel order, see below |
 
@@ -35,6 +37,7 @@ back. Touching the terrain stops it, until reset.
 | F1 | force arrows: lift (green, red when stalled) and drag (magenta) per meter of span, bodies (blue) per meter of length, thrust (yellow), and the total lift at the center of lift (cyan) |
 | F2 | the aerodynamic model: strips, control surfaces as deflected, bound vortices, body cells, rotor discs, center of gravity |
 | F3 | hide the 3D model |
+| F4 | the wind blowing at the aircraft, and the thermals nearby as rings at its height |
 
 A gamepad flies mode 2: throttle and yaw on the left stick, roll and pitch on the right.
 
@@ -87,11 +90,46 @@ independent of rendering (`src/sim`).
   torque and gyroscopic moments of its rotors. With the engine off, a propeller windmills. Surfaces and bodies behind a rotor are in its **slipstream**, after momentum theory, so
   a tail behind a propeller keeps some authority even without airspeed.
 - **Actuators** follow their commands with a first order response and a rate limit.
-- **Wind** is anything implementing `WindField`, which may vary in space and time. For now there
-  is a constant wind.
+- **Wind** varies over the aircraft: it is sampled at both ends of each axis of the aircraft, so
+  that a gust hits one wing harder than the other, and each strip, body cell and rotor sees the
+  wind where it is. See [Weather](#weather).
 
 The sensors report what a flight controller would measure, without noise: angular rates and
 specific force in the body frame, position, velocity, attitude, airspeed and battery state.
+
+## Weather
+
+The weather is defined in RON, see [`assets/weather`](assets/weather) for examples and
+[`src/sim/weather`](src/sim/weather) for the documented schema, and reloaded whenever it is
+saved. `()` is calm air in the standard atmosphere, and `--wind` and `--turbulence` override
+the definition.
+
+```bash
+cargo run --release -- --weather assets/weather/breezy.ron    # wind, gusts, light turbulence
+cargo run --release -- --weather assets/weather/soaring.ron   # thermals and ridge lift
+cargo run --release -- --weather assets/weather/front.ron     # a low moving in
+```
+
+The weather is a function of where and when it is sampled, from a seed, without state of its
+own: it is the same however often it is sampled, and the same seed gives the same weather.
+What drifts with the air (turbulence, gusts and thermals) drifts with the wind aloft at the spawn
+point.
+
+- The **wind aloft** is the `wind` plus the geostrophic wind around **pressure systems**: highs
+  and lows, which may move. Below the top of the **boundary layer**, the wind slows down
+  logarithmically towards the ground, and turns towards low pressure.
+- **Gusts** add to the wind aloft for a few seconds, rising and falling as one minus a cosine.
+- **Turbulence** is a sum of random waves with the von Kármán spectrum, with the intensities and
+  scales of MIL-HDBK-1797, which shrink towards the ground.
+- **Thermals** rise from the ground to the top of the convective layer, and are ringed by sinking
+  air, after the model of Allen (2006). They come and go, and drift with the wind.
+- **Ridge lift** follows the slope of the terrain below the wind. Only the slope right below the
+  aircraft is known, so the lift fades with the height above it.
+- The **air** is the standard atmosphere from the pressure and temperature at sea level, which the
+  pressure systems change. Its density sets the lift, drag and thrust.
+
+ArduPilot is told the wind, but works out the air pressure from the altitude itself, so it does
+not see the pressure systems in its barometer.
 
 ## Aircraft
 

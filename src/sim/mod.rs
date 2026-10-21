@@ -14,6 +14,7 @@ pub mod config;
 pub mod environment;
 pub mod propulsion;
 pub mod runner;
+pub mod weather;
 
 use bevy::math::{DMat3, DQuat, DVec2, DVec3, EulerRot};
 
@@ -21,8 +22,9 @@ use crate::geo;
 use actuator::Actuators;
 use aero::{AeroLoads, Aerodynamics, Flow, Slipstream};
 use config::AircraftConfig;
-use environment::{WindField, air_density, gravity, ned_to_ecef, ned_to_ecef_at};
-use propulsion::{RotorModel, RotorState};
+use environment::{gravity, ned_to_ecef, ned_to_ecef_at};
+use propulsion::{RotorModel, RotorState, battery_voltage};
+use weather::{Ground, Probe, Weather};
 
 /// Duration of a simulation step in seconds.
 pub const STEP: f64 = 0.001;
@@ -106,24 +108,23 @@ pub struct Simulation {
     /// Points of the aircraft checked for contact with the ground, relative to the center of
     /// gravity.
     extremities: Vec<DVec3>,
+    /// How far the aircraft reaches from the center of gravity along each axis, over which the
+    /// wind is sampled for how it changes across the aircraft.
+    reach: DVec3,
     pub body: RigidBody,
     pub status: Status,
     pub time: f64,
     pub spawn: Spawn,
-    pub wind: Box<dyn WindField>,
+    pub weather: Weather,
     /// Height of the terrain below the aircraft, provided by whoever knows the terrain.
-    pub ground: f64,
+    pub ground: Ground,
     pub loads: Loads,
     specific_force: DVec3,
     battery_current: f64,
 }
 
 impl Simulation {
-    pub fn new(
-        config: AircraftConfig,
-        spawn: Spawn,
-        wind: Box<dyn WindField>,
-    ) -> Result<Self, String> {
+    pub fn new(config: AircraftConfig, spawn: Spawn, weather: Weather) -> Result<Self, String> {
         if config.mass <= 0.0 {
             return Err("the mass must be positive".into());
         }
@@ -169,6 +170,9 @@ impl Simulation {
         for point in &mut extremities {
             *point -= center_of_gravity;
         }
+        let reach = extremities
+            .iter()
+            .fold(DVec3::splat(0.1), |reach, p| reach.max(p.abs()));
 
         let mut simulation = Self {
             rotor_states: vec![RotorState::default(); rotors.len()],
@@ -176,6 +180,7 @@ impl Simulation {
             inertia,
             inertia_inverse: inertia.inverse(),
             extremities,
+            reach,
             config,
             aero,
             rotors,
@@ -185,8 +190,8 @@ impl Simulation {
             status: Status::Held,
             time: 0.0,
             spawn,
-            wind,
-            ground: f64::NEG_INFINITY,
+            weather,
+            ground: Ground::UNKNOWN,
             loads: Loads::default(),
             specific_force: DVec3::ZERO,
             battery_current: 0.0,
@@ -205,7 +210,7 @@ impl Simulation {
     }
 
     /// Carry on with another aircraft, such as an edited definition of this one, from where
-    /// this one is: in flight or held, at the same time, place and attitude, in the same wind.
+    /// this one is: in flight or held, at the same time, place and attitude, in the same weather.
     /// Actuators and rotors keep their state where their names match.
     pub fn replace_aircraft(&mut self, mut next: Simulation) {
         next.body = self.body;
@@ -225,7 +230,7 @@ impl Simulation {
                 *state = self.rotor_states[i];
             }
         }
-        std::mem::swap(&mut next.wind, &mut self.wind);
+        std::mem::swap(&mut next.weather, &mut self.weather);
         *self = next;
     }
 
@@ -242,16 +247,24 @@ impl Simulation {
         self.actuators.step(dt);
 
         let body = self.body;
-        let wind = self.wind.velocity(body.position, self.time);
+        let (wind, gradient) = self.wind_across();
         let to_body = body.attitude.inverse();
         let air = to_body * (wind - body.velocity);
-        let (_, height) = geo::from_ecef(body.position);
-        let density = air_density(height);
+        let density = self.weather.air(&self.probe(body.position)).density;
 
-        // The battery sags under the current of the previous step
+        // The battery sags under the current the motors draw, which in turn depends on how much
+        // it sags. Taking the current of the previous step instead would make the two oscillate
+        // from step to step, once the battery resistance is half that of the motors it drives.
+        let loads: Vec<(f64, f64)> = self
+            .rotors
+            .iter()
+            .zip(&self.rotor_states)
+            .filter_map(|(rotor, state)| {
+                rotor.battery_load(state, self.actuators.positions()[rotor.throttle])
+            })
+            .collect();
         let battery = &self.config.battery;
-        let voltage =
-            (battery.voltage - battery.internal_resistance * self.battery_current).max(0.0);
+        let voltage = battery_voltage(battery.voltage, battery.internal_resistance, &loads);
         let mut force = DVec3::ZERO;
         let mut moment = DVec3::ZERO;
         let mut current = 0.0;
@@ -259,7 +272,7 @@ impl Simulation {
         let mut slipstreams: Vec<Slipstream> = Vec::with_capacity(self.rotors.len());
         for (rotor, state) in self.rotors.iter().zip(&mut self.rotor_states) {
             let offset = rotor.position - self.center_of_gravity;
-            let rotor_air = air - body.rates.cross(offset);
+            let rotor_air = air + gradient * offset - body.rates.cross(offset);
             let throttle = self.actuators.positions()[rotor.throttle];
             let output = rotor.step(
                 state,
@@ -280,6 +293,7 @@ impl Simulation {
 
         let aero = self.aero.loads(&Flow {
             velocity: air,
+            gradient,
             rates: body.rates,
             density,
             actuators: self.actuators.positions(),
@@ -332,7 +346,7 @@ impl Simulation {
 
     fn touches_ground(&self) -> bool {
         let body = &self.body;
-        let surface = geo::EARTH_RADIUS + self.ground;
+        let surface = geo::EARTH_RADIUS + self.ground.height;
         // Most of the time the aircraft is far above the ground
         if body.position.length() - surface > 100.0 {
             return false;
@@ -353,7 +367,7 @@ impl Simulation {
         let to_ned = ned_to_ecef_at(lon_lat).inverse();
         let attitude_ned = to_ned * body.attitude;
         let (yaw, pitch, roll) = attitude_ned.to_euler(EulerRot::ZYX);
-        let wind = self.wind.velocity(body.position, self.time);
+        let wind = self.wind_at(body.position);
         let air = body.attitude.inverse() * (wind - body.velocity);
         let battery = &self.config.battery;
         Sensors {
@@ -370,8 +384,38 @@ impl Simulation {
             wind_ned: to_ned * wind,
             battery_voltage: battery.voltage - battery.internal_resistance * self.battery_current,
             battery_current: self.battery_current,
-            height_above_ground: altitude - self.ground,
+            height_above_ground: altitude - self.ground.height,
         }
+    }
+
+    /// Where the weather is sampled at an ECEF position, now.
+    fn probe(&self, position: DVec3) -> Probe {
+        Probe::new(position, self.time, self.ground)
+    }
+
+    /// Velocity of the air in ECEF at an ECEF position, now.
+    fn wind_at(&self, position: DVec3) -> DVec3 {
+        self.weather.wind(&self.probe(position))
+    }
+
+    /// The wind at the center of gravity in ECEF, and how it changes across the aircraft, in
+    /// the body frame. The change is that between opposite ends of the aircraft, which averages
+    /// out the gusts smaller than the aircraft, as they would on the real one.
+    fn wind_across(&self) -> (DVec3, DMat3) {
+        let body = &self.body;
+        let to_body = body.attitude.inverse();
+        let column = |axis: DVec3, reach: f64| {
+            let offset = body.attitude * axis * reach;
+            let change =
+                self.wind_at(body.position + offset) - self.wind_at(body.position - offset);
+            to_body * change / (2.0 * reach)
+        };
+        let gradient = DMat3::from_cols(
+            column(DVec3::X, self.reach.x),
+            column(DVec3::Y, self.reach.y),
+            column(DVec3::Z, self.reach.z),
+        );
+        (self.wind_at(body.position), gradient)
     }
 
     /// Position in ECEF of a point given in the model frame.
@@ -394,7 +438,6 @@ fn spawn_body(spawn: &Spawn) -> RigidBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use environment::ConstantWind;
 
     fn spawn() -> Spawn {
         Spawn {
@@ -432,7 +475,7 @@ mod tests {
                 inertia: (ixx: 0.1, iyy: 0.1, izz: 0.1), actuators: [])"#,
         )
         .unwrap();
-        let mut sim = Simulation::new(config, spawn(), Box::new(ConstantWind::default())).unwrap();
+        let mut sim = Simulation::new(config, spawn(), Weather::calm()).unwrap();
         sim.launch();
         sim.body.velocity = DVec3::ZERO;
         for _ in 0..1000 {
@@ -455,7 +498,7 @@ mod tests {
     fn aircraft(name: &str) -> Simulation {
         let path = format!("{}/assets/aircraft/{name}.ron", env!("CARGO_MANIFEST_DIR"));
         let config = AircraftConfig::load(path).unwrap();
-        Simulation::new(config, spawn(), Box::new(ConstantWind::default())).unwrap()
+        Simulation::new(config, spawn(), Weather::calm()).unwrap()
     }
 
     /// What the pilot does while flying with otherwise fixed sticks.
@@ -513,6 +556,7 @@ mod tests {
                 sim.aero.reset();
                 let loads = sim.aero.loads(&aero::Flow {
                     velocity: DVec3::new(-alpha.cos(), 0.0, -alpha.sin()) * 15.0,
+                    gradient: DMat3::ZERO,
                     rates: DVec3::ZERO,
                     density: 1.225,
                     actuators: &actuators,
@@ -650,9 +694,7 @@ mod tests {
         let mut config = sim.config.clone();
         config.mass *= 1.1;
         config.actuators.swap(0, 1);
-        sim.replace_aircraft(
-            Simulation::new(config, spawn(), Box::new(ConstantWind::default())).unwrap(),
-        );
+        sim.replace_aircraft(Simulation::new(config, spawn(), Weather::calm()).unwrap());
         assert_eq!(sim.status, Status::Flying);
         assert_eq!((sim.body.position, sim.time), (body.position, time));
         assert_eq!(sim.rotor_states[0].speed, rpm);
@@ -662,10 +704,61 @@ mod tests {
         assert_eq!(sim.status, Status::Flying);
     }
 
+    /// Turbulence shakes the aircraft about all its axes, as gusts hit one wing harder than the
+    /// other, but it flies on.
+    #[test]
+    fn flies_through_turbulence() {
+        let rms_rates = |turbulence: f64| {
+            let mut sim = aircraft("uav");
+            let origin = DVec2::new(7f64.to_radians(), 46f64.to_radians());
+            let config = weather::WeatherConfig {
+                turbulence,
+                ..Default::default()
+            };
+            sim.weather = Weather::new(config, origin);
+            fly(&mut sim, sticks(0.0, 0.0, 0.0, 0.6), Hands::Level, 2.0);
+            let mut sum = DVec3::ZERO;
+            for _ in 0..10 {
+                let rates = fly(&mut sim, sticks(0.0, 0.0, 0.0, 0.6), Hands::Level, 1.0).gyro;
+                sum += rates * rates;
+            }
+            (sum / 10.0).map(f64::sqrt)
+        };
+        let calm = rms_rates(0.0);
+        let rough = rms_rates(1.54);
+        assert!(rough.x > 0.1 && rough.y > 0.02 && rough.z > 0.02, "{rough}");
+        assert!(rough.x > 10.0 * calm.x, "{calm} {rough}");
+    }
+
+    /// A battery with more internal resistance than the motor it drives sags steadily under its
+    /// current, rather than alternating between sagging and not from step to step.
+    #[test]
+    fn battery_sags_steadily() {
+        let mut config = aircraft("uav").config;
+        let motor = config.rotors[0].motor.as_ref().unwrap();
+        config.battery.internal_resistance = 2.0 * motor.resistance;
+        let mut sim = Simulation::new(config, spawn(), Weather::calm()).unwrap();
+        sim.actuators
+            .set_commands(&sim.config.mix(&sticks(0.0, 0.0, 0.0, 1.0)));
+        sim.actuators.settle();
+        for _ in 0..1000 {
+            sim.step(STEP);
+        }
+        let mut currents = Vec::new();
+        for _ in 0..4 {
+            sim.step(STEP);
+            currents.push(sim.sensors().battery_current);
+        }
+        assert!(currents[0] > 5.0, "{currents:?}");
+        for pair in currents.windows(2) {
+            assert!((pair[1] / pair[0] - 1.0).abs() < 0.001, "{currents:?}");
+        }
+    }
+
     #[test]
     fn crashes_into_the_ground() {
         let mut sim = aircraft("uav");
-        sim.ground = 995.0;
+        sim.ground = Ground::flat(995.0);
         sim.launch();
         for _ in 0..60_000 {
             sim.step(STEP);

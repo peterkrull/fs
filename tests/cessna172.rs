@@ -11,9 +11,8 @@
 //! is the equivalent airspeed, which the tests hold.
 
 use bevy_worldmap::sim::{
-    STEP, Sensors, Simulation, Spawn, Status,
-    config::AircraftConfig,
-    environment::{ConstantWind, air_density},
+    STEP, Sensors, Simulation, Spawn, Status, config::AircraftConfig, environment::air_density,
+    weather::Weather,
 };
 
 const KNOT: f64 = 1852.0 / 3600.0;
@@ -51,7 +50,7 @@ fn cessna(altitude_ft: f64, knots: f64) -> Simulation {
         heading: 0.0,
         speed: knots * KNOT / (density / 1.225).sqrt(),
     };
-    let mut sim = Simulation::new(config, spawn, Box::new(ConstantWind::default())).unwrap();
+    let mut sim = Simulation::new(config, spawn, Weather::calm()).unwrap();
     sim.launch();
     sim
 }

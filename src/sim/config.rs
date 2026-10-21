@@ -58,8 +58,9 @@ impl AircraftConfig {
     }
 }
 
-/// Watches an aircraft definition for changes. It compares modification times, which works
-/// both with editors that write the file in place and with those that replace it.
+/// Watches a definition, such as of an aircraft or the weather, for changes. It compares
+/// modification times, which works both with editors that write the file in place and with
+/// those that replace it.
 pub struct Watcher {
     path: PathBuf,
     /// Modification time of the definition when it was last loaded, and when last polled.
@@ -85,7 +86,10 @@ impl Watcher {
 
     /// The definition, if it changed since it was last loaded. To not read a file that is
     /// still being written, it is only loaded once it is unchanged since the previous poll.
-    pub fn poll(&mut self) -> Option<Result<AircraftConfig, String>> {
+    pub fn poll<T>(
+        &mut self,
+        load: impl FnOnce(&Path) -> Result<T, String>,
+    ) -> Option<Result<T, String>> {
         let modified = modified(&self.path);
         let settled = modified == self.polled;
         self.polled = modified;
@@ -93,7 +97,7 @@ impl Watcher {
             return None;
         }
         self.loaded = modified;
-        Some(AircraftConfig::load(&self.path))
+        Some(load(&self.path))
     }
 }
 
@@ -556,22 +560,23 @@ mod tests {
         };
         write(BALL, 1000);
         let mut watcher = Watcher::new(&path);
-        assert!(watcher.poll().is_none());
+        let load = |path: &Path| AircraftConfig::load(path);
+        assert!(watcher.poll(load).is_none());
 
         // Saved, but only loaded once it stays the same for a poll
         write(&BALL.replace("1.0,", "2.0,"), 2000);
-        assert!(watcher.poll().is_none());
-        let config = watcher.poll().unwrap().unwrap();
+        assert!(watcher.poll(load).is_none());
+        let config = watcher.poll(load).unwrap().unwrap();
         assert_eq!(config.mass, 2.0);
-        assert!(watcher.poll().is_none());
+        assert!(watcher.poll(load).is_none());
 
         // Errors are reported, and the next save is loaded again
         write("(name: ", 3000);
-        assert!(watcher.poll().is_none());
-        assert!(watcher.poll().unwrap().is_err());
+        assert!(watcher.poll(load).is_none());
+        assert!(watcher.poll(load).unwrap().is_err());
         write(BALL, 4000);
-        assert!(watcher.poll().is_none());
-        assert!(watcher.poll().unwrap().is_ok());
+        assert!(watcher.poll(load).is_none());
+        assert!(watcher.poll(load).unwrap().is_ok());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

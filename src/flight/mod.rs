@@ -27,6 +27,7 @@ use crate::{
         Simulation, Status,
         config::{AircraftConfig, Sticks, Watcher},
         runner::{Mode, Request, SimHandle, Snapshot},
+        weather::{Ground, Probe},
     },
     tiles::Tiles,
 };
@@ -133,8 +134,9 @@ pub struct Flight {
     pub model: Simulation,
     pub snapshot: Snapshot,
     watcher: Watcher,
+    weather_watcher: Option<Watcher>,
     options: Options,
-    /// Why the edited definition could not be loaded, until it can.
+    /// Why an edited definition could not be loaded, until it can.
     reload_error: Option<String>,
 }
 
@@ -143,8 +145,9 @@ impl Flight {
         let watcher = Watcher::new(path);
         let config = AircraftConfig::load(path)?;
         let spawn = options.spawn_for(&config);
-        let model = Simulation::new(config.clone(), spawn, Box::new(options.wind))?;
-        let simulation = Simulation::new(config, spawn, Box::new(options.wind))?;
+        let weather = options.build_weather()?;
+        let model = Simulation::new(config.clone(), spawn, weather.clone())?;
+        let simulation = Simulation::new(config, spawn, weather)?;
         let handle = SimHandle::spawn(simulation, options.mode).map_err(|err| format!("{err}"))?;
         let snapshot = handle.snapshot();
         Ok(Self {
@@ -152,6 +155,7 @@ impl Flight {
             model,
             snapshot,
             watcher,
+            weather_watcher: options.weather.as_ref().map(Watcher::new),
             options: options.clone(),
             reload_error: None,
         })
@@ -160,9 +164,10 @@ impl Flight {
     /// Carry on with another aircraft, from where the current one is.
     fn replace_aircraft(&mut self, config: AircraftConfig) -> Result<(), String> {
         let spawn = self.options.spawn_for(&config);
-        let wind = Box::new(self.options.wind);
-        let model = Simulation::new(config.clone(), spawn, wind.clone())?;
-        let simulation = Simulation::new(config, spawn, wind)?;
+        // Simulations keep their weather when replacing their aircraft
+        let weather = self.model.weather.clone();
+        let model = Simulation::new(config.clone(), spawn, weather.clone())?;
+        let simulation = Simulation::new(config, spawn, weather)?;
         self.handle.replace_aircraft(simulation);
         self.model = model;
         Ok(())
@@ -179,8 +184,8 @@ impl Flight {
     }
 }
 
-/// Load the aircraft again whenever its definition is saved. A definition with errors is
-/// reported, and the aircraft flies on as it was.
+/// Load the aircraft or the weather again whenever its definition is saved. A definition with
+/// errors is reported, and the aircraft flies on as it was.
 fn reload(
     time: Res<Time>,
     mut next: Local<f32>,
@@ -192,7 +197,27 @@ fn reload(
         return;
     }
     *next = now + RELOAD_INTERVAL;
-    let Some(config) = flight.watcher.poll() else {
+    let flight = &mut *flight;
+    let options = &flight.options;
+    if let Some(weather) = flight
+        .weather_watcher
+        .as_mut()
+        .and_then(|watcher| watcher.poll(|_| options.build_weather()))
+    {
+        match weather {
+            Ok(weather) => {
+                info!("Reloaded the weather from {:?}", options.weather);
+                flight.handle.replace_weather(weather.clone());
+                flight.model.weather = weather;
+                flight.reload_error = None;
+            }
+            Err(err) => {
+                error!("Unable to reload the weather: {err}");
+                flight.reload_error = Some(err);
+            }
+        }
+    }
+    let Some(config) = flight.watcher.poll(|path| AircraftConfig::load(path)) else {
         return;
     };
     match config.and_then(|config| flight.replace_aircraft(config)) {
@@ -211,9 +236,23 @@ fn reload(
 fn take_snapshot(mut flight: ResMut<Flight>, tiles: Res<Tiles>) {
     flight.snapshot = flight.handle.snapshot();
     let (lon_lat, _) = geo::from_ecef(flight.snapshot.body.position);
-    if let Some(ground) = tiles.height_at(lon_lat, 15) {
-        flight.handle.set_ground(ground as f64);
-    }
+    let height = |lon_lat: DVec2| tiles.height_at(lon_lat, 15).map(f64::from);
+    let Some(ground) = height(lon_lat) else {
+        return;
+    };
+    // The slope over the distance the ridge lift is reckoned over
+    let distance = flight.model.weather.config().ridge_lift.scale.max(10.0);
+    let east = DVec2::X * distance / (geo::EARTH_RADIUS * lon_lat.y.cos());
+    let north = DVec2::Y * distance / geo::EARTH_RADIUS;
+    let around = [east, -east, north, -north].map(|offset| height(lon_lat + offset));
+    let slope = match around {
+        [Some(e), Some(w), Some(n), Some(s)] => DVec2::new(e - w, n - s) / (2.0 * distance),
+        _ => DVec2::ZERO,
+    };
+    flight.handle.set_ground(Ground {
+        height: ground,
+        slope,
+    });
 }
 
 fn keys(
@@ -244,6 +283,9 @@ fn keys(
     }
     if keys.just_pressed(KeyCode::F3) {
         debug.model = !debug.model;
+    }
+    if keys.just_pressed(KeyCode::F4) {
+        debug.weather = !debug.weather;
     }
 }
 
@@ -510,6 +552,11 @@ fn update_panel(
         .map(|r| format!("{:.0}", r.speed * 60.0 / std::f64::consts::TAU))
         .collect();
     let ground_speed = DVec2::new(s.velocity_ned.x, s.velocity_ned.y).length();
+    let wind = s.wind_ned;
+    let weather = &flight.model.weather;
+    let probe = Probe::new(snapshot.body.position, s.time, Ground::UNKNOWN);
+    let air = weather.air(&probe);
+    let sea_level = Probe::new(geo::to_ecef(probe.lon_lat, 0.0), s.time, Ground::UNKNOWN);
 
     let reload_error = match &flight.reload_error {
         Some(err) => format!("\nnot reloaded: {err}"),
@@ -519,6 +566,8 @@ fn update_panel(
         "{}{reload_error}\n{link}   {:.1}x real time\n{status}\n\n\
          airspeed {:.1} m/s   ground speed {:.1} m/s   climb {:+.1} m/s\n\
          altitude {:.0} m   above ground {:.0} m\n\
+         wind from {:03.0} at {:.1} m/s   vertical {:+.1} m/s\n\
+         sea level {:.0} hPa   air {:.0} C {:.3} kg/m3\n\
          roll {:+.0}   pitch {:+.0}   heading {:.0} deg\n\
          {}\nrpm {}   battery {:.1} V {:.1} A\n\
          accel {:+.2} {:+.2} {:+.2} m/s2   gyro {:+.2} {:+.2} {:+.2} rad/s\n\
@@ -530,6 +579,12 @@ fn update_panel(
         -s.velocity_ned.z,
         s.altitude,
         s.height_above_ground,
+        (-wind.y).atan2(-wind.x).to_degrees().rem_euclid(360.0),
+        DVec2::new(wind.x, wind.y).length(),
+        -wind.z,
+        weather.air(&sea_level).pressure / 100.0,
+        air.temperature - 273.15,
+        air.density,
         s.euler.x.to_degrees(),
         s.euler.y.to_degrees(),
         s.euler.z.to_degrees().rem_euclid(360.0),
@@ -547,7 +602,7 @@ fn update_panel(
         s.longitude,
     );
     text.push_str(&format!(
-        "\n\nL: launch   R: reset   Tab: {} camera\nF1: forces{}   F2: aerodynamic model{}   F3: {} aircraft",
+        "\n\nL: launch   R: reset   Tab: {} camera\nF1: forces{}   F2: aerodynamic model{}   F3: {} aircraft   F4: weather{}",
         match *mode {
             CameraMode::Chase => "free",
             CameraMode::Free => "chase",
@@ -555,6 +610,7 @@ fn update_panel(
         if debug.forces { " (on)" } else { "" },
         if debug.schema { " (on)" } else { "" },
         if debug.model { "hide" } else { "show" },
+        if debug.weather { " (on)" } else { "" },
     ));
     if flight.handle.mode == Mode::RealTime {
         match pilot.radio {

@@ -101,6 +101,7 @@ fn main() {
             forces: views.contains("forces"),
             schema: views.contains("schema"),
             model: !views.contains("nomodel"),
+            weather: views.contains("weather"),
         });
     }
     if let Some(lon) = std::env::var("WORLDMAP_SUN_LON")

@@ -8,6 +8,7 @@ use bevy_worldmap::{
         Simulation, Status,
         config::{ActuatorKind, AircraftConfig, Watcher},
         runner::{Request, SimHandle},
+        weather::Ground,
     },
 };
 
@@ -51,26 +52,34 @@ fn run() -> Result<(), String> {
         .actuators
         .iter()
         .position(|a| a.kind == ActuatorKind::Throttle);
-    let simulation = Simulation::new(
-        config.clone(),
-        options.spawn_for(&config),
-        Box::new(options.wind),
-    )?;
+    let mut weather_watcher = options.weather.as_ref().map(Watcher::new);
+    let mut weather = options.build_weather()?;
+    let simulation = Simulation::new(config.clone(), options.spawn_for(&config), weather.clone())?;
     let handle = SimHandle::spawn(simulation, options.mode).map_err(|err| err.to_string())?;
-    handle.set_ground(ground);
+    handle.set_ground(Ground::flat(ground));
 
     let mut launched = false;
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        // Carry on with the edited definition whenever it is saved
-        match watcher.poll().map(|config| {
-            let config = config?;
-            Simulation::new(
-                config.clone(),
-                options.spawn_for(&config),
-                Box::new(options.wind),
-            )
-        }) {
+        // Carry on with the edited definitions whenever they are saved
+        match weather_watcher
+            .as_mut()
+            .and_then(|watcher| watcher.poll(|_| options.build_weather()))
+        {
+            Some(Ok(next)) => {
+                handle.replace_weather(next.clone());
+                weather = next;
+                println!("Reloaded the weather from {:?}", options.weather);
+            }
+            Some(Err(err)) => eprintln!("Unable to reload the weather: {err}"),
+            None => {}
+        }
+        match watcher
+            .poll(|path| AircraftConfig::load(path))
+            .map(|config| {
+                let config = config?;
+                Simulation::new(config.clone(), options.spawn_for(&config), weather.clone())
+            }) {
             Some(Ok(simulation)) => {
                 handle.replace_aircraft(simulation);
                 println!("Reloaded the aircraft from {path:?}");
@@ -98,12 +107,18 @@ fn run() -> Result<(), String> {
             })
             .unwrap_or_default();
         println!(
-            "t {:7.1}  {:8}  alt {:7.1}  agl {:6.1}  airspeed {:5.1}  roll {:6.1}  pitch {:6.1}  heading {:5.1}  throttle {:4.2}  {:.1}x{link}",
+            "t {:7.1}  {:8}  alt {:7.1}  agl {:6.1}  airspeed {:5.1}  wind {:03.0}/{:4.1}{:+5.1}  roll {:6.1}  pitch {:6.1}  heading {:5.1}  throttle {:4.2}  {:.1}x{link}",
             snapshot.time,
             format!("{:?}", snapshot.status),
             s.altitude,
             s.height_above_ground,
             s.airspeed,
+            (-s.wind_ned.y)
+                .atan2(-s.wind_ned.x)
+                .to_degrees()
+                .rem_euclid(360.0),
+            s.wind_ned.x.hypot(s.wind_ned.y),
+            -s.wind_ned.z,
             s.euler.x.to_degrees(),
             s.euler.y.to_degrees(),
             s.euler.z.to_degrees().rem_euclid(360.0),

@@ -35,7 +35,7 @@
 
 use std::{collections::VecDeque, f64::consts::PI};
 
-use bevy::math::DVec3;
+use bevy::math::{DMat3, DVec3};
 
 use super::{
     airfoil::{AirfoilModel, Flap},
@@ -147,6 +147,9 @@ pub struct AeroLoads {
 pub struct Flow<'a> {
     /// Velocity of the air relative to the center of gravity.
     pub velocity: DVec3,
+    /// How the wind changes across the aircraft: the change of its velocity with the position
+    /// relative to the center of gravity, as gusts hit one part harder than another.
+    pub gradient: DMat3,
     /// Angular velocity of the aircraft.
     pub rates: DVec3,
     pub density: f64,
@@ -202,7 +205,7 @@ impl Flow<'_> {
     /// Velocity of the air relative to a point of the aircraft, given relative to the center
     /// of gravity.
     fn at(&self, offset: DVec3) -> DVec3 {
-        self.velocity - self.rates.cross(offset)
+        self.velocity + self.gradient * offset - self.rates.cross(offset)
     }
 }
 
@@ -962,6 +965,7 @@ mod tests {
         let (sb, cb) = beta.sin_cos();
         Flow {
             velocity: -DVec3::new(ca * cb, sb, sa * cb) * 20.0,
+            gradient: DMat3::ZERO,
             rates: DVec3::ZERO,
             density: 1.225,
             actuators: &[],
@@ -1003,6 +1007,7 @@ mod tests {
         let alpha = 5f64.to_radians();
         let flow = Flow {
             velocity: DVec3::new(-alpha.cos(), 0.0, -alpha.sin()) * speed,
+            gradient: DMat3::ZERO,
             rates: DVec3::ZERO,
             density: 1.225,
             actuators: &[],
@@ -1177,8 +1182,8 @@ mod tests {
             aero.loads(&before);
         }
         let first = aero.loads(&after).moment.y;
-        // The wake takes 4 m at 20 m/s to reach the tail
-        for _ in 0..100 {
+        // The wake takes 4 m at 20 m/s, 200 steps, to reach the tail
+        for _ in 0..300 {
             aero.loads(&after);
         }
         let steady = aero.loads(&after).moment.y;
@@ -1321,6 +1326,7 @@ mod tests {
         let mut aero = wing(12);
         let flow = Flow {
             velocity: DVec3::new(-20.0, 0.0, 0.0),
+            gradient: DMat3::ZERO,
             rates: DVec3::new(1.0, 0.0, 0.0),
             density: 1.225,
             actuators: &[],

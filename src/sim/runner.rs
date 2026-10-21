@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{Loads, RigidBody, STEP, Sensors, Simulation, Status, propulsion::RotorState};
+use super::{
+    Loads, RigidBody, STEP, Sensors, Simulation, Status, propulsion::RotorState,
+    weather::{Ground, Weather},
+};
 use crate::sitl::{self, Frame, FrameTracker, Link};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +59,9 @@ struct Shared {
     snapshot: Snapshot,
     /// An aircraft to carry on with, see [`Simulation::replace_aircraft`].
     replacement: Option<Simulation>,
+    weather: Option<Weather>,
     commands: Vec<f64>,
-    ground: f64,
+    ground: Ground,
     requests: Vec<Request>,
     stop: bool,
 }
@@ -77,6 +81,7 @@ impl SimHandle {
         let shared = Arc::new(Mutex::new(Shared {
             snapshot: snapshot(&simulation, None, 0.0),
             replacement: None,
+            weather: None,
             commands: simulation.actuators.commands().to_vec(),
             ground: simulation.ground,
             requests: Vec::new(),
@@ -107,15 +112,20 @@ impl SimHandle {
         self.lock().commands = commands.to_vec();
     }
 
-    /// The height of the terrain below the aircraft.
-    pub fn set_ground(&self, height: f64) {
-        self.lock().ground = height;
+    /// The terrain below the aircraft.
+    pub fn set_ground(&self, ground: Ground) {
+        self.lock().ground = ground;
     }
 
     /// Carry on with another aircraft from where the current one is, such as after its
     /// definition was edited.
     pub fn replace_aircraft(&self, simulation: Simulation) {
         self.lock().replacement = Some(simulation);
+    }
+
+    /// Carry on in other weather, such as after its definition was edited.
+    pub fn replace_weather(&self, weather: Weather) {
+        self.lock().weather = Some(weather);
     }
 
     pub fn request(&self, request: Request) {
@@ -143,6 +153,9 @@ fn sync_inputs(simulation: &mut Simulation, shared: &Mutex<Shared>, commands: bo
     let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(next) = shared.replacement.take() {
         simulation.replace_aircraft(next);
+    }
+    if let Some(weather) = shared.weather.take() {
+        simulation.weather = weather;
     }
     simulation.ground = shared.ground;
     if commands {

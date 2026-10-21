@@ -1,0 +1,25 @@
+// A low approaching from the northwest of the default spawn point over Interlaken, with a
+// southwesterly wind of about 11 m/s aloft blowing around it, gusts and moderate turbulence.
+//
+// The wind of a pressure system adds to `wind`, which is calm here. The pressure at sea level is
+// shown in the flight panel, and falls as the low comes closer.
+(
+    seed: 3,
+    pressure_systems: [
+        (
+            // Where its center is at the start, in degrees
+            lat: 49.5,
+            lon: 4.0,
+            // 12 hPa below the pressure around it at its center: negative for a low, positive
+            // for a high
+            pressure: -12,
+            // The distance from the center where the pressure changes the fastest, in km
+            radius: 500,
+            // Moving east at 12 m/s
+            course: 90,
+            speed: 12,
+        ),
+    ],
+    turbulence: 1.54,
+    gusts: (speed: 6, interval: 20, duration: 5, radius: 300),
+)

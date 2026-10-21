@@ -1,0 +1,17 @@
+// A good soaring day: a light wind, and thermals rising to 1800 m above the terrain.
+//
+// The thermals drift with the wind, last a quarter of an hour each, and are ringed by sinking
+// air. Press F4 in the viewer to see the thermals near the aircraft.
+(
+    seed: 7,
+    wind: (from: 300, speed: 3),
+    turbulence: 0.5,
+    // Updraft at the core of an average thermal in m/s, the top of the convective layer above
+    // the terrain in m, the mean distance between thermals in m, and their lifetime in s
+    thermals: (strength: 2.5, top: 1800, spacing: 1200, lifetime: 900),
+    // The wind lifts as it blows up the slopes, over 150 m of terrain, and fading over 150 m
+    // above it
+    ridge_lift: (scale: 150),
+    // A warm day, at standard pressure
+    sea_level: (pressure: 1013.25, temperature: 28),
+)

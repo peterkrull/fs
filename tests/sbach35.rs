@@ -7,11 +7,11 @@
 //! aileron deflection rolls it at several hundred degrees per second, and the elevator and
 //! rudder are powerful enough for snaps.
 
-use bevy::math::DVec3;
+use bevy::math::{DMat3, DVec3};
 use bevy_worldmap::sim::{
     STEP, Sensors, Simulation, Spawn, Status, aero,
     config::{self, AircraftConfig},
-    environment::ConstantWind,
+    weather::Weather,
 };
 
 const LAUNCH_SPEED: f64 = 27.0;
@@ -26,7 +26,7 @@ fn aircraft() -> Simulation {
         heading: 0.0,
         speed: LAUNCH_SPEED,
     };
-    Simulation::new(config, spawn, Box::new(ConstantWind::default())).unwrap()
+    Simulation::new(config, spawn, Weather::calm()).unwrap()
 }
 
 fn sticks(roll: f64, pitch: f64, yaw: f64, throttle: f64) -> config::Sticks {
@@ -66,6 +66,7 @@ fn stable_and_trimmed_at_cruise() {
         sim.aero.reset();
         let loads = sim.aero.loads(&aero::Flow {
             velocity: DVec3::new(-alpha.cos(), 0.0, -alpha.sin()) * LAUNCH_SPEED,
+            gradient: DMat3::ZERO,
             rates: DVec3::ZERO,
             density: 1.225,
             actuators: &actuators,

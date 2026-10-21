@@ -1,0 +1,192 @@
+// The HEEWING T2 Cruza, a 1.2 m twin motor FPV plane. The planform is measured from the
+// dimensioned top view of the manufacturer, and the propulsion is that of the manual and the
+// spare parts: 2216 750 kV motors and 8055 propellers. Not documented, and so assumed: the
+// center of gravity, for a static margin of about 25%, the incidences, the airfoils, the height
+// of the tail, and the inertia, estimated from the parts.
+(
+    name: "HEEWING T2 Cruza",
+    // With a large 6S2P lithium ion pack, at the top of the recommended 1.5 to 2.5 kg
+    mass: 2.4,
+    center_of_gravity: (-0.31, 0.0, 0.0),
+    inertia: (ixx: 0.065, iyy: 0.09, izz: 0.15),
+
+    airfoils: {
+        // A Clark Y-like cambered airfoil at low Reynolds numbers
+        "clark_y": Parametric(
+            lift_slope: 5.8,
+            zero_lift_angle: -3.5,
+            cd_min: 0.013,
+            cd_k: 0.012,
+            cm: -0.08,
+            stall_positive: 13.0,
+            stall_negative: -8.0,
+            shape: (thickness: 0.117, camber: 0.035),
+        ),
+        "naca0012": Parametric(
+            lift_slope: 5.9,
+            cd_min: 0.014,
+            cd_k: 0.01,
+            stall_positive: 11.0,
+            stall_negative: -11.0,
+            shape: (thickness: 0.12),
+        ),
+    },
+
+    surfaces: [
+        (
+            name: "wing",
+            airfoil: "clark_y",
+            // Carried through the fuselage, which carries its lift across
+            root: (-0.216, 0.0, -0.02),
+            root_chord: 0.288,
+            incidence: 0.0,
+            mirror: true,
+            sections: [
+                (span: 0.072, tip_chord: 0.282, sweep: 4.1, cells: 2),
+                (
+                    span: 0.528,
+                    tip_chord: 0.172,
+                    sweep: 4.1,
+                    dihedral: 2.0,
+                    twist: -0.5,
+                    cells: 15,
+                    controls: [
+                        (
+                            actuator: "aileron",
+                            deflection: -20.0,
+                            chord_fraction: 0.32,
+                            extent: (0.35, 0.91),
+                            mirror: Antisymmetric,
+                        ),
+                    ],
+                ),
+            ],
+        ),
+        (
+            name: "horizontal tail",
+            airfoil: "naca0012",
+            root: (-0.87, 0.0, -0.02),
+            root_chord: 0.163,
+            incidence: -1.0,
+            mirror: true,
+            sections: [
+                (
+                    span: 0.262,
+                    tip_chord: 0.128,
+                    sweep: 7.6,
+                    cells: 8,
+                    controls: [(
+                        actuator: "elevator",
+                        deflection: -20.0,
+                        chord_fraction: 0.4,
+                        extent: (0.0, 0.79),
+                    )],
+                ),
+            ],
+        ),
+        (
+            // All-moving
+            name: "fin",
+            airfoil: "naca0012",
+            root: (-0.90, 0.0, -0.03),
+            root_chord: 0.12,
+            sections: [
+                (
+                    span: 0.22,
+                    tip_chord: 0.10,
+                    sweep: 21.0,
+                    dihedral: 90.0,
+                    cells: 4,
+                    controls: [(actuator: "rudder", deflection: 25.0, chord_fraction: 1.0)],
+                ),
+            ],
+        ),
+    ],
+
+    bodies: [
+        (
+            name: "fuselage",
+            nose: (0.0, 0.0, 0.0),
+            length: 1.04,
+            profile: [
+                (0.0, 0.0),
+                (0.02, 0.045),
+                (0.054, 0.06),
+                (0.157, 0.067),
+                (0.26, 0.068),
+                (0.363, 0.063),
+                (0.466, 0.046),
+                (0.529, 0.023),
+                (0.57, 0.011),
+                (1.0, 0.010),
+            ],
+            cells: 14,
+        ),
+        (
+            name: "right motor nacelle",
+            nose: (-0.165, 0.215, 0.0),
+            length: 0.14,
+            profile: [(0.0, 0.012), (0.15, 0.028), (0.7, 0.028), (1.0, 0.015)],
+            cells: 3,
+        ),
+        (
+            name: "left motor nacelle",
+            nose: (-0.165, -0.215, 0.0),
+            length: 0.14,
+            profile: [(0.0, 0.012), (0.15, 0.028), (0.7, 0.028), (1.0, 0.015)],
+            cells: 3,
+        ),
+    ],
+
+    rotors: [
+        (
+            name: "left propeller",
+            position: (-0.176, -0.215, 0.0),
+            // Thrusting forward and slightly down, towards the center of gravity
+            axis: (1.0, 0.0, 0.02),
+            // An 8x5.5 propeller, the top of the disc turning outboard
+            diameter: 0.203,
+            spin: CounterClockwise,
+            ct: 0.10,
+            cp: 0.045,
+            zero_thrust_advance: 0.8,
+            inertia: 0.00004,
+            // A 2216 750 kV motor
+            motor: (kv: 750.0, resistance: 0.08, no_load_current: 0.6),
+            throttle: "throttle",
+        ),
+        (
+            name: "right propeller",
+            position: (-0.176, 0.215, 0.0),
+            axis: (1.0, 0.0, 0.02),
+            diameter: 0.203,
+            spin: Clockwise,
+            ct: 0.10,
+            cp: 0.045,
+            zero_thrust_advance: 0.8,
+            inertia: 0.00004,
+            motor: (kv: 750.0, resistance: 0.08, no_load_current: 0.6),
+            throttle: "throttle",
+        ),
+    ],
+
+    // A 6S2P lithium ion pack, at its nominal voltage
+    battery: (voltage: 21.6, internal_resistance: 0.04),
+
+    // Servos turning 60° in 0.1 s, over a travel of ±20° to ±25° of the surfaces
+    actuators: [
+        (name: "aileron", channel: 1, time_constant: 0.02, slew_rate: 20.0, input: [(Roll, 1.0)]),
+        (name: "elevator", channel: 2, time_constant: 0.02, slew_rate: 20.0, input: [(Pitch, 1.0)]),
+        (
+            name: "throttle",
+            kind: Throttle,
+            channel: 3,
+            time_constant: 0.01,
+            slew_rate: 20.0,
+            input: [(Throttle, 1.0)],
+        ),
+        (name: "rudder", channel: 4, time_constant: 0.02, slew_rate: 20.0, input: [(Yaw, 1.0)]),
+    ],
+
+    visual: Generated,
+)

@@ -4,7 +4,13 @@
 use bevy::{math::DVec3, prelude::*};
 
 use super::Flight;
-use crate::camera::View;
+use crate::{
+    camera::View,
+    sim::{
+        environment::ned_to_ecef,
+        weather::{Ground, Probe},
+    },
+};
 
 #[derive(Resource)]
 pub struct DebugView {
@@ -14,6 +20,8 @@ pub struct DebugView {
     pub schema: bool,
     /// The 3D model of the aircraft.
     pub model: bool,
+    /// The wind at the aircraft, and the thermals nearby.
+    pub weather: bool,
 }
 
 impl Default for DebugView {
@@ -22,6 +30,7 @@ impl Default for DebugView {
             forces: false,
             schema: false,
             model: true,
+            weather: false,
         }
     }
 }
@@ -35,6 +44,8 @@ const TOTAL: Color = Color::srgb(0.2, 0.95, 0.95);
 const OUTLINE: Color = Color::srgb(0.9, 0.9, 0.9);
 const CONTROL: Color = Color::srgb(1.0, 0.55, 0.1);
 const VORTEX: Color = Color::srgb(0.4, 0.5, 1.0);
+const WIND: Color = Color::srgb(0.85, 0.95, 1.0);
+const THERMAL: Color = Color::srgb(1.0, 0.6, 0.2);
 
 pub(super) fn startup(mut store: ResMut<GizmoConfigStore>) {
     // Drawn over the aircraft, so that the forces inside the wings are visible
@@ -49,7 +60,7 @@ pub(super) fn draw(
     debug: Res<DebugView>,
     mut gizmos: Gizmos,
 ) {
-    if !debug.forces && !debug.schema {
+    if !debug.forces && !debug.schema && !debug.weather {
         return;
     }
     let model = &flight.model;
@@ -75,6 +86,29 @@ pub(super) fn draw(
     let load_scale = 0.1 * span * span / weight;
     let point_scale = load_scale * 20.0 / span;
     let total_scale = 0.3 * span / weight;
+
+    if debug.weather {
+        // Blowing at the aircraft from upwind, a span long for 5 m/s
+        let wind = ned_to_ecef(snapshot.body.position) * snapshot.sensors.wind_ned;
+        let cg = at(model.center_of_gravity);
+        let vector = (wind * (span / 5.0)).as_vec3();
+        arrow(&mut gizmos, cg - vector * 1.2, vector, WIND);
+
+        // The thermals at the height of the aircraft, as rings as wide as they are, with their
+        // cores up to where they would lift the aircraft in a minute
+        let s = &snapshot.sensors;
+        let ground = Ground::flat(s.altitude - s.height_above_ground);
+        let probe = Probe::new(snapshot.body.position, snapshot.time, ground);
+        let up = probe.position.normalize();
+        let rotation = Quat::from_rotation_arc(Vec3::Z, up.as_vec3());
+        for (center, radius, updraft) in model.weather.thermals(&probe) {
+            let color = THERMAL.with_alpha((updraft.abs() / 3.0).clamp(0.2, 1.0) as f32);
+            let core = (center - view.position).as_vec3();
+            gizmos.circle(Isometry3d::new(core, rotation), radius as f32, color);
+            let rise = (up * updraft.max(0.0) * 60.0).as_vec3();
+            gizmos.line(core, core + rise, color);
+        }
+    }
 
     if debug.forces {
         let loads = &snapshot.loads;
