@@ -48,6 +48,13 @@ pub struct TerrainParams {
     /// Which edges are moved onto the parent, where they border a coarser tile: those at
     /// `u = 0`, `u = 1`, `v = 0` and `v = 1`, as `1`.
     pub edges: Vec4,
+    /// The texture transforms of the imagery of the level above the imagery and the previous
+    /// imagery, which they blend into towards where that level would be drawn.
+    pub coarser_uv_transform: Vec4,
+    pub previous_coarser_uv_transform: Vec4,
+    /// The detail threshold and anisotropy of the level of detail in `x` and `y`, and the zoom
+    /// levels of the tiles the imagery and the previous imagery are drawn for in `z` and `w`.
+    pub lod: Vec4,
 }
 
 impl TerrainParams {
@@ -60,12 +67,18 @@ impl TerrainParams {
             previous_color: base_color.to_linear().to_vec4(),
             fade: Vec4::ONE,
             edges: Vec4::ZERO,
+            coarser_uv_transform: Vec4::new(0.0, 0.0, 1.0, 0.0),
+            previous_coarser_uv_transform: Vec4::new(0.0, 0.0, 1.0, 0.0),
+            // Zoom 0, which never blends
+            lod: Vec4::new(1.0, 0.0, 0.0, 0.0),
         }
     }
 }
 
 /// The terrain, which fades from imagery to imagery, and from the geometry of the parent tile
-/// to its own, with [`TerrainParams::fade`].
+/// to its own, with [`TerrainParams::fade`]. Both the imagery and the previous imagery blend
+/// into the imagery of the level above them, across the distances over which the level of
+/// detail changes, so that imagery of different zoom levels meets without a seam.
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
 pub struct TerrainMaterial {
     #[uniform(0)]
@@ -85,6 +98,10 @@ pub struct TerrainMaterial {
     pub aerial_inscattering: Handle<Image>,
     #[texture(8, dimension = "3d")]
     pub aerial_transmittance: Handle<Image>,
+    #[texture(10)]
+    pub coarser: Option<Handle<Image>>,
+    #[texture(11)]
+    pub previous_coarser: Option<Handle<Image>>,
 }
 
 impl TerrainMaterial {
@@ -94,6 +111,8 @@ impl TerrainMaterial {
             params,
             imagery: None,
             previous: None,
+            coarser: None,
+            previous_coarser: None,
             transmittance: luts.transmittance.clone(),
             irradiance: luts.irradiance.clone(),
             aerial_inscattering: luts.aerial_inscattering.clone(),

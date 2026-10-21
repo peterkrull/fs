@@ -8,7 +8,6 @@ use bevy::{
     camera::Hdr,
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
     math::{DQuat, DVec2, DVec3},
-    post_process::bloom::Bloom,
     prelude::*,
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
 };
@@ -162,7 +161,6 @@ fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         Hdr,
-        Bloom::NATURAL,
         Projection::Perspective(PerspectiveProjection {
             fov: 60f32.to_radians(),
             near: 0.5,

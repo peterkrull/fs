@@ -48,7 +48,8 @@ pub struct Imagery {
     pub data: Vec<u8>,
 }
 
-/// Height samples of a tile in meters, row by row from the north-west corner.
+/// Height samples of a tile in meters, row by row from the north-west corner. Where the source
+/// has no data, the heights are NaN until [`crate::tiles::Tiles`] fills them in.
 pub struct HeightGrid {
     pub size: usize,
     pub heights: Vec<f32>,
@@ -353,14 +354,17 @@ async fn decode(source: Source, bytes: Vec<u8>) -> Outcome {
     let decoded = tokio::task::spawn_blocking(move || {
         let image = image::load_from_memory(&bytes).ok()?;
         Some(match source {
-            Source::Terrain => Payload::Elevation(decode_terrarium(image.into_rgb8())),
-            _ => Payload::Imagery(build_mipmaps(image.into_rgba8())),
+            Source::Terrain => match decode_terrarium(image.into_rgb8()) {
+                Some(grid) => Outcome::Loaded(Payload::Elevation(grid)),
+                None => Outcome::Missing,
+            },
+            _ => Outcome::Loaded(Payload::Imagery(build_mipmaps(image.into_rgba8()))),
         })
     })
     .await;
 
     match decoded {
-        Ok(Some(payload)) => Outcome::Loaded(payload),
+        Ok(Some(outcome)) => outcome,
         _ => {
             log::warn!("Unable to decode a {} tile", source.name());
             Outcome::Failed
@@ -373,17 +377,23 @@ async fn decode(source: Source, bytes: Vec<u8>) -> Outcome {
 ///
 /// The tiles include the depth of the oceans, which is clamped to sea level, as the imagery
 /// shows the surface of the water.
-fn decode_terrarium(image: image::RgbImage) -> HeightGrid {
+///
+/// Black pixels, which would be 32768 m below sea level, are where the source has no data. At
+/// its finest zoom levels, it has whole tiles of them in places, such as over the mountains of
+/// Sardinia, which are `None`, as if the source did not have the tile.
+fn decode_terrarium(image: image::RgbImage) -> Option<HeightGrid> {
     let size = image.width().min(image.height()) as usize;
     let mut heights = Vec::with_capacity(size * size);
     for y in 0..size as u32 {
         for x in 0..size as u32 {
             let [r, g, b] = image.get_pixel(x, y).0;
-            let height = r as f32 * 256.0 + g as f32 + b as f32 / 256.0 - 32768.0;
-            heights.push(height.max(0.0));
+            heights.push(match [r, g, b] {
+                [0, 0, 0] => f32::NAN,
+                _ => (r as f32 * 256.0 + g as f32 + b as f32 / 256.0 - 32768.0).max(0.0),
+            });
         }
     }
-    HeightGrid { size, heights }
+    (!heights.iter().all(|h| h.is_nan())).then_some(HeightGrid { size, heights })
 }
 
 /// Build the full chain of mipmaps, averaging in linear color space. This is needed for
@@ -459,6 +469,19 @@ mod tests {
         let expected: usize = (0..9).map(|l| (256 >> l) * (256 >> l) * 4).sum();
         assert_eq!(imagery.data.len(), expected);
         assert_eq!(&imagery.data[imagery.data.len() - 4..], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn terrarium_gaps() {
+        // 1000 m, and no data
+        let mut image = image::RgbImage::from_pixel(4, 4, image::Rgb([131, 232, 0]));
+        image.put_pixel(1, 2, image::Rgb([0, 0, 0]));
+        let grid = decode_terrarium(image).unwrap();
+        assert_eq!(grid.heights[0], 1000.0);
+        assert!(grid.heights[2 * 4 + 1].is_nan());
+
+        let empty = image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 0]));
+        assert!(decode_terrarium(empty).is_none());
     }
 
     #[test]

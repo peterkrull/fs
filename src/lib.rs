@@ -9,6 +9,7 @@ pub mod hud;
 pub mod material;
 pub mod mesh;
 pub mod options;
+pub mod post;
 pub mod scattering;
 pub mod sim;
 pub mod sitl;

@@ -3,6 +3,7 @@
 use bevy_worldmap::{
     atmosphere, camera, flight, hud, material,
     options::{Options, USAGE},
+    post,
     sim::runner::Request,
     sources, terrain, tiles,
 };
@@ -36,6 +37,7 @@ fn main() {
         camera::CameraPlugin { start },
         terrain::TerrainPlugin,
         atmosphere::AtmospherePlugin,
+        post::PostProcessPlugin,
         hud::HudPlugin,
         flight::FlightPlugin { options },
     ));

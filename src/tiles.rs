@@ -170,7 +170,8 @@ impl Tiles {
                     },
                 );
             }
-            Payload::Elevation(grid) => {
+            Payload::Elevation(mut grid) => {
+                self.fill_gaps(key.1, &mut grid);
                 let value = Arc::new(grid);
                 self.elevation.insert(
                     key.1,
@@ -182,6 +183,24 @@ impl Tiles {
                 );
                 self.elevation_version += 1;
             }
+        }
+    }
+
+    /// Fill the heights where the source has no data from the best ancestor available, or with
+    /// sea level, so that gaps in the data do not drop to the bottom of the sea.
+    fn fill_gaps(&self, tile: TileId, grid: &mut HeightGrid) {
+        let size = grid.size as f64;
+        for (index, height) in grid.heights.iter_mut().enumerate() {
+            if !height.is_nan() {
+                continue;
+            }
+            let (i, j) = ((index % grid.size) as f64, (index / grid.size) as f64);
+            let unit = tile.unit((i + 0.5) / size, (j + 0.5) / size);
+            *height = tile
+                .lineage()
+                .skip(1)
+                .find_map(|id| Some(self.elevation.get(&id)?.value.sample(id.local(unit))))
+                .unwrap_or(0.0);
         }
     }
 

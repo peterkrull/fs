@@ -17,9 +17,13 @@
 //! through finer geometry. Instead, a tile fades in from its parent after a split: its geometry
 //! morphs from that of the parent, and its imagery blends over that of the parent. Before a
 //! merge, the children fade out into their parent the same way. Tiles also blend into better
-//! imagery as it arrives. Imagery of different zoom levels often differs in tone, which would
-//! otherwise make every change of the level of detail stand out. Terrain that just came into
-//! view does not fade, but appears with the most detail available, see [`APPEAR_SECONDS`].
+//! imagery as it arrives, and morph into better elevation. Imagery of different zoom levels
+//! often differs in tone, which would otherwise make every change of the level of detail stand
+//! out.
+//!
+//! Only changes to terrain which was in view in the previous frame fade. Terrain that the
+//! camera just turned or moved to appears at once with the most detail available, as it was
+//! not seen before.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -68,10 +72,6 @@ const MERGE_AT_ONCE: f64 = 0.25;
 /// this much faster. The level of detail then catches up quickly with a camera moving closer,
 /// or after the start, while changes around the threshold stay gradual.
 const MAX_FADE_SPEEDUP: f64 = 8.0;
-/// For this many seconds after a tile came into view, it refines without fading, so that
-/// terrain the camera turns to appears with the most detail available, also while its finer
-/// meshes are still being built.
-const APPEAR_SECONDS: f64 = 0.5;
 
 pub struct TerrainPlugin;
 
@@ -130,6 +130,8 @@ pub struct Terrain {
     queue: Vec<Build>,
     building: usize,
     frame: u64,
+    /// What the tiles were seen from in the previous frame.
+    last_eye: Option<Eye>,
     pub stats: Stats,
 }
 
@@ -144,9 +146,10 @@ struct Node {
     bounds: Bounds,
     built: Option<Built>,
     task: Option<Task<TileMesh>>,
-    /// The imagery the tile is drawn with, which its material keeps alive, and the imagery it
-    /// is blending in from.
+    /// The imagery the tile is drawn with, which its material keeps alive, the imagery of the
+    /// level above that it blends into, and the imagery it is fading in from.
     imagery: Option<Shown>,
+    coarser: Option<Shown>,
     fade: Option<Fade>,
     /// How far the tile has faded in from its parent, from `0`, where it looks like its
     /// parent, to `1`.
@@ -155,9 +158,10 @@ struct Node {
     wanted: f64,
     /// The last frame in which the tile was in view.
     visited: u64,
-    /// When the tile came into view, in seconds.
-    appeared: f64,
-    /// Whether the tile was drawn as its children in the last frame.
+    /// Whether the tile was in view in the previous frame, so that changes to it are seen and
+    /// fade, rather than happen at once.
+    seen: bool,
+    /// Whether the tile was drawn as its children in the last frame in which it was visited.
     split: bool,
     /// Whether the tile is drawn in this frame, but was not in the last.
     fresh: bool,
@@ -175,18 +179,23 @@ struct Shown {
 
 /// Blending from one imagery into the next.
 struct Fade {
-    /// The previous imagery, or the placeholder.
+    /// The previous imagery, or the placeholder, and the imagery above it.
     from: Option<Shown>,
+    from_coarser: Option<Shown>,
     progress: f32,
 }
 
 #[derive(PartialEq)]
 struct Drawn {
     imagery: Option<Key>,
+    coarser: Option<Key>,
     previous: Option<Key>,
+    previous_coarser: Option<Key>,
     morph: f32,
     fade: f32,
     edges: [bool; 4],
+    /// The detail threshold and anisotropy.
+    lod: (f64, f64),
 }
 
 struct Built {
@@ -217,11 +226,12 @@ impl Node {
             built: None,
             task: None,
             imagery: None,
+            coarser: None,
             fade: None,
             morph: 1.0,
             wanted: 0.0,
             visited: 0,
-            appeared: f64::NEG_INFINITY,
+            seen: false,
             split: false,
             fresh: false,
             edges: [false; 4],
@@ -281,6 +291,7 @@ impl Bounds {
 }
 
 /// What the tiles are seen from.
+#[derive(Clone)]
 struct Eye {
     position: DVec3,
     lon_lat: DVec2,
@@ -378,11 +389,12 @@ impl Eye {
 }
 
 impl Terrain {
-    /// Select the tiles to draw within `tile`. While `merging`, its parent is waiting for it to
-    /// fade out.
+    /// Select the tiles to draw within `tile`, which is in view of `eye`, and was in view of
+    /// `last_eye` if [`Node::seen`]. While `merging`, its parent is waiting for it to fade out.
     fn visit(
         &mut self,
         eye: &Eye,
+        last_eye: Option<&Eye>,
         tiles: &mut Tiles,
         tile: TileId,
         heights: (f32, f32),
@@ -392,8 +404,12 @@ impl Terrain {
         let frame = self.frame;
         let node = self.nodes.entry(tile).or_insert_with(|| Node::new(tile));
         node.wanted = eye.now;
+        // Whether the tile was split is only known if it was visited, as its parent may have
+        // been drawn instead
+        let visited_before = node.visited + 1 == frame;
         node.visited = frame;
         let heights = node.heights(heights);
+        node.seen = last_eye.is_some_and(|last| last.visible(tile, &node.bounds, heights));
         let (distance, detail) = eye.detail(tile, &node.bounds, heights);
 
         tiles.request(
@@ -434,7 +450,7 @@ impl Terrain {
             }
         }
         let ready = node.ready(frame);
-        let (split, morph) = (node.split, node.morph);
+        let (split, morph) = (node.split && visited_before, node.morph);
         let threshold = match split {
             true => eye.threshold * SPLIT_HYSTERESIS,
             false => eye.threshold,
@@ -447,12 +463,16 @@ impl Terrain {
         if (refine && (split || morph >= 1.0)) || fade_out {
             let children = tile.children();
             let mut visible = [false; 4];
+            let mut seen = [false; 4];
             let mut children_ready = true;
             let mut faded_out = true;
             for (i, child) in children.into_iter().enumerate() {
                 let node = self.nodes.entry(child).or_insert_with(|| Node::new(child));
                 node.wanted = eye.now;
-                visible[i] = eye.visible(child, &node.bounds, node.heights(heights));
+                let child_heights = node.heights(heights);
+                visible[i] = eye.visible(child, &node.bounds, child_heights);
+                seen[i] =
+                    last_eye.is_some_and(|last| last.visible(child, &node.bounds, child_heights));
                 faded_out &= !visible[i] || (!node.split && node.morph <= 0.0);
                 if !node.ready(frame) {
                     children_ready = false;
@@ -467,24 +487,18 @@ impl Terrain {
                 }
             }
             if children_ready && !(fade_out && faded_out) {
-                // Children only fade in where the tile was on screen, and had been for a moment.
-                // Where the camera just turned to, they appear at once.
-                let appeared = self.nodes.get(&tile).map_or(0.0, |node| node.appeared);
-                let on_screen =
-                    self.rendered.contains(&tile) && eye.now - appeared >= APPEAR_SECONDS;
-                for (child, visible) in children.into_iter().zip(visible) {
+                // Children only fade in where the tile was in view. Where the camera just
+                // turned or moved to, they appear at once.
+                for (i, child) in children.into_iter().enumerate() {
                     let Some(node) = self.nodes.get_mut(&child) else {
                         continue;
                     };
-                    let entering = visible && node.visited + 1 < frame;
                     if !split {
-                        node.morph = if on_screen && visible { 0.0 } else { 1.0 };
-                        node.appeared = appeared;
-                    } else if entering {
+                        node.morph = if seen[i] { 0.0 } else { 1.0 };
+                    } else if visible[i] && !seen[i] {
                         // Drawn the way the rest of the tile is, which is faded out into the
                         // tile when it is merging
                         node.morph = if fade_out { 0.0 } else { 1.0 };
-                        node.appeared = eye.now;
                     }
                 }
                 if fade_out {
@@ -498,7 +512,7 @@ impl Terrain {
                 }
                 self.set_split(tile, true);
                 for (child, _) in children.into_iter().zip(visible).filter(|(_, v)| *v) {
-                    self.visit(eye, tiles, child, heights, fade_out, out);
+                    self.visit(eye, last_eye, tiles, child, heights, fade_out, out);
                 }
                 return;
             }
@@ -595,9 +609,11 @@ fn select_tiles(
     }
 
     let eye = Eye::new(&view, &settings, time.delta_secs(), time.elapsed_secs_f64());
+    let last_eye = terrain.last_eye.take();
     let mut rendered = Vec::new();
     terrain.visit(
         &eye,
+        last_eye.as_ref(),
         &mut tiles,
         TileId::ROOT,
         (0.0, MAX_HEIGHT),
@@ -605,6 +621,7 @@ fn select_tiles(
         &mut rendered,
     );
     terrain.start_builds(&mut tiles);
+    terrain.last_eye = Some(eye);
 
     let current: HashSet<TileId> = rendered.into_iter().collect();
     terrain.stats.coarsened += terrain
@@ -746,12 +763,13 @@ fn update_tiles(
     }
 
     let fade_step = time.delta_secs() / FADE_SECONDS;
-    let now = time.elapsed_secs_f64();
+    let source = settings.imagery;
     for tile in &terrain.rendered {
+        // What the parent was drawn with, which the tile fades in from
         let parent = tile
             .parent()
             .and_then(|parent| terrain.nodes.get(&parent))
-            .and_then(|parent| parent.imagery.clone());
+            .map(|parent| (parent.imagery.clone(), parent.coarser.clone()));
         let Some(node) = terrain.nodes.get_mut(tile) else {
             continue;
         };
@@ -759,22 +777,31 @@ fn update_tiles(
             continue;
         };
 
-        // A tile that just appeared takes the best imagery at once, as it either fades in from
-        // its parent, appears where its children faded out into it, or has just come into
-        // view. Otherwise the tile blends into better imagery, once it has faded in.
-        let best = tiles.best_imagery(settings.imagery, *tile);
-        let better = better_imagery(&node.imagery, settings.imagery, best);
-        if node.fresh || now - node.appeared < APPEAR_SECONDS {
+        // The imagery the tile blends into, which is that of its parent, or its own if that is
+        // no finer
+        let better = better_imagery(&node.imagery, source, tiles.best_imagery(source, *tile));
+        let imagery = better.clone().unwrap_or_else(|| node.imagery.clone());
+        let best_coarser = match &imagery {
+            Some(own) if own.key.1.zoom < tile.zoom => Some((own.key.1, own.image.clone())),
+            Some(_) => tile
+                .parent()
+                .and_then(|parent| tiles.best_imagery(source, parent)),
+            None => None,
+        };
+        let better_coarser = better_imagery(&node.coarser, source, best_coarser);
+        let changed = better.is_some() || better_coarser.is_some();
+        let coarser = better_coarser.unwrap_or_else(|| node.coarser.clone());
+
+        // A tile takes the best imagery at once where it was not in view, or while it starts to
+        // fade in from its parent. Otherwise it blends into better imagery, once it has faded
+        // in, which includes where its children just faded out into it.
+        if !node.seen || (node.fresh && node.morph < 1.0) {
             node.fade = None;
-            if let Some(better) = better {
-                node.imagery = better;
-            }
-        } else if node.morph >= 1.0
-            && let Some(better) = better
-        {
-            let from = std::mem::replace(&mut node.imagery, better);
+            (node.imagery, node.coarser) = (imagery, coarser);
+        } else if node.morph >= 1.0 && changed {
             node.fade = Some(Fade {
-                from,
+                from: std::mem::replace(&mut node.imagery, imagery),
+                from_coarser: std::mem::replace(&mut node.coarser, coarser),
                 progress: 0.0,
             });
         }
@@ -785,17 +812,32 @@ fn update_tiles(
             }
         }
 
-        let (previous, weight) = match &node.fade {
-            _ if node.morph < 1.0 => (parent, node.morph),
-            Some(fade) => (fade.from.clone(), fade.progress),
-            None => (None, 1.0),
+        let (previous, previous_coarser, previous_zoom, weight) = match &node.fade {
+            _ if node.morph < 1.0 => {
+                let (imagery, coarser) = parent.unwrap_or_default();
+                (imagery, coarser, tile.zoom.saturating_sub(1), node.morph)
+            }
+            Some(fade) => (
+                fade.from.clone(),
+                fade.from_coarser.clone(),
+                tile.zoom,
+                fade.progress,
+            ),
+            None => (None, None, tile.zoom, 1.0),
         };
+        // Without imagery above, the imagery blends into itself
+        let coarser = node.coarser.clone().or_else(|| node.imagery.clone());
+        let previous_coarser = previous_coarser.or_else(|| previous.clone());
+        let key = |shown: &Option<Shown>| shown.as_ref().map(|shown| shown.key);
         let drawn = Drawn {
-            imagery: node.imagery.as_ref().map(|shown| shown.key),
-            previous: previous.as_ref().map(|shown| shown.key),
+            imagery: key(&node.imagery),
+            coarser: key(&coarser),
+            previous: key(&previous),
+            previous_coarser: key(&previous_coarser),
             morph: node.morph,
             edges: node.edges,
             fade: weight,
+            lod: (settings.lod_threshold, settings.anisotropy),
         };
         if node.drawn.as_ref() == Some(&drawn) {
             continue;
@@ -806,10 +848,21 @@ fn update_tiles(
         let params = &mut material.params;
         (params.uv_transform, params.base_color) = imagery_params(*tile, &node.imagery);
         (params.previous_uv_transform, params.previous_color) = imagery_params(*tile, &previous);
+        params.coarser_uv_transform = imagery_params(*tile, &coarser).0;
+        params.previous_coarser_uv_transform = imagery_params(*tile, &previous_coarser).0;
         params.fade = Vec4::new(ease(node.morph), ease(weight), 0.0, 0.0);
         params.edges = Vec4::from_array(node.edges.map(|edge| edge as u8 as f32));
-        material.imagery = node.imagery.as_ref().map(|shown| shown.image.clone());
-        material.previous = previous.map(|shown| shown.image);
+        params.lod = Vec4::new(
+            settings.lod_threshold as f32,
+            settings.anisotropy as f32,
+            tile.zoom as f32,
+            previous_zoom as f32,
+        );
+        let image = |shown: Option<Shown>| shown.map(|shown| shown.image);
+        material.imagery = image(node.imagery.clone());
+        material.coarser = image(coarser);
+        material.previous = image(previous);
+        material.previous_coarser = image(previous_coarser);
         node.drawn = Some(drawn);
     }
 

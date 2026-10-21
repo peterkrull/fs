@@ -17,7 +17,7 @@ const HELP: &str = "\
 Click: capture mouse   Esc: release   Right drag: look   Scroll: zoom or speed
 Free camera: W A S D fly   Space / C: up / down   Shift: faster
 T: toggle imagery   [ ]: move the sun   , .: haze   - =: level of detail
-F: freeze tiles   H: hide help";
+F: freeze tiles   P: toggle exposure and grading   H: hide help";
 
 pub struct HudPlugin;
 
