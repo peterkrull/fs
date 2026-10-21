@@ -78,7 +78,6 @@ fn apply(post: Res<PostProcess>, camera: Single<Entity, With<Camera3d>>, mut com
     let mut grading = ColorGrading::default();
     grading.global.post_saturation = 1.1;
     grading.midtones.contrast = 1.1;
-    grading.shadows.gain = 1.1;
     camera.insert((
         AutoExposure {
             range: METERED,

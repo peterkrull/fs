@@ -163,13 +163,15 @@ pub(super) fn spawn(
     }
 
     // Rotors are drawn either way, as they spin
-    let blade_material = material(&mut materials, Color::srgb(0.08, 0.08, 0.09));
+    let blade_color = Color::srgb(0.08, 0.08, 0.09);
+    let blade_material = material(&mut materials, blade_color);
+    // The blades smeared over the disc, lit as they are
     let disc_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.1, 0.1, 0.1, 0.25),
+        base_color: blade_color.with_alpha(0.25),
         alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 0.55,
         double_sided: true,
         cull_mode: None,
-        unlit: true,
         ..default()
     });
     for (index, rotor) in model.rotors.iter().enumerate() {
