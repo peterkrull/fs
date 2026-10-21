@@ -38,6 +38,7 @@ back. Touching the terrain stops it, until reset.
 | F2 | the aerodynamic model: strips, control surfaces as deflected, bound vortices, body cells, rotor discs, center of gravity |
 | F3 | hide the 3D model |
 | F4 | the wind blowing at the aircraft, and the thermals nearby as rings at its height |
+| F11 | fullscreen |
 
 A gamepad flies mode 2: throttle and yaw on the left stick, roll and pitch on the right.
 

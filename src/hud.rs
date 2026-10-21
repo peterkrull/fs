@@ -3,6 +3,7 @@
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
+    window::{MonitorSelection, PrimaryWindow, WindowMode},
 };
 
 use crate::{
@@ -17,7 +18,7 @@ const HELP: &str = "\
 Click: capture mouse   Esc: release   Right drag: look   Scroll: zoom or speed
 Free camera: W A S D fly   Space / C: up / down   Shift: faster
 T: toggle imagery   [ ]: move the sun   , .: haze   - =: level of detail
-F: freeze tiles   P: toggle exposure and grading   H: hide help";
+F: freeze tiles   P: toggle exposure and grading   H: hide help   F11: fullscreen";
 
 pub struct HudPlugin;
 
@@ -84,6 +85,7 @@ fn controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut settings: ResMut<TerrainSettings>,
     mut help: Single<&mut Visibility, With<Help>>,
+    mut window: Single<&mut Window, With<PrimaryWindow>>,
 ) {
     if keys.just_pressed(KeyCode::KeyT) {
         let index = Source::IMAGERY
@@ -103,6 +105,13 @@ fn controls(
     }
     if keys.just_pressed(KeyCode::KeyH) {
         help.toggle_visible_hidden();
+    }
+    // Borderless, as Wayland has no exclusive fullscreen
+    if keys.just_pressed(KeyCode::F11) {
+        window.mode = match window.mode {
+            WindowMode::Windowed => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+            _ => WindowMode::Windowed,
+        };
     }
 }
 
